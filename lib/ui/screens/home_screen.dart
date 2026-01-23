@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:mhf_log_shield/data/repositories/settings_repository.dart';
 import 'package:mhf_log_shield/ui/screens/settings_screen.dart';
 import 'package:mhf_log_shield/utils/connection_tester.dart';
+import 'package:mhf_log_shield/utils/log_sender.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -12,6 +13,7 @@ class HomeScreen extends StatefulWidget {
 
 class _HomeScreenState extends State<HomeScreen> {
   final SettingsRepository _settings = SettingsRepository();
+  final LogSender _logSender = LogSender();
   bool _isConfigured = false;
   bool _isCollecting = false;
   String _connectionMode = 'UDP';
@@ -77,6 +79,237 @@ class _HomeScreenState extends State<HomeScreen> {
         _isTesting = false;
       });
     }
+  }
+
+  Future<void> _sendTestLog() async {
+    final serverUrl = _settings.getServerUrl();
+    final apiKey = _settings.getApiKey();
+    
+    if (serverUrl.isEmpty) {
+      _showMessage('Configure server first', isError: true);
+      return;
+    }
+
+    _showMessage('Sending test log...');
+    
+    setState(() {
+      _isTesting = true;
+    });
+
+    try {
+      final success = await _logSender.sendTestLog(serverUrl, apiKey);
+      
+      if (success) {
+        _showMessage('Test log sent to $_serverAddress');
+        
+        // Show verification instructions
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          _showVerificationInstructions();
+        });
+      } else {
+        _showMessage('Failed to send test log', isError: true);
+      }
+    } catch (e) {
+      print('Test log error: $e');
+      _showMessage('Error: $e', isError: true);
+    } finally {
+      setState(() {
+        _isTesting = false;
+      });
+    }
+  }
+
+  Future<void> _sendMultipleTestLogs() async {
+    final serverUrl = _settings.getServerUrl();
+    final apiKey = _settings.getApiKey();
+    
+    if (serverUrl.isEmpty) {
+      _showMessage('Configure server first', isError: true);
+      return;
+    }
+
+    _showMessage('Sending multiple test formats...');
+    
+    setState(() {
+      _isTesting = true;
+    });
+
+    try {
+      final results = await _logSender.sendMultipleTestLogs(serverUrl, apiKey);
+      
+      final successCount = results.where((r) => r).length;
+      
+      if (successCount > 0) {
+        _showMessage('$successCount out of ${results.length} test logs sent successfully');
+        
+        // Show verification help
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          showDialog(
+            context: context,
+            builder: (context) => AlertDialog(
+              title: const Text('Check Wazuh Server'),
+              content: const Text(
+                'Test logs sent with 3 different formats:\n'
+                '1. Syslog format (RFC3164)\n'
+                '2. Simple text format\n'
+                '3. Key=Value format\n\n'
+                'Check Wazuh logs to see which format is accepted:\n'
+                'sudo tail -f /var/ossec/logs/archives/archives.log'
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(context),
+                  child: const Text('OK'),
+                ),
+              ],
+            ),
+          );
+        });
+      } else {
+        _showMessage('All test logs failed', isError: true);
+      }
+    } catch (e) {
+      print('Multiple test logs error: $e');
+      _showMessage('Error: $e', isError: true);
+    } finally {
+      setState(() {
+        _isTesting = false;
+      });
+    }
+  }
+
+  Future<void> _sendCustomLog() async {
+    final serverUrl = _settings.getServerUrl();
+    final apiKey = _settings.getApiKey();
+    
+    if (serverUrl.isEmpty) {
+      _showMessage('Configure server first', isError: true);
+      return;
+    }
+
+    TextEditingController messageController = TextEditingController(
+      text: 'Custom test log from MHF Log Shield app'
+    );
+    String selectedLevel = 'INFO';
+
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Send Custom Log'),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              DropdownButtonFormField<String>(
+                value: selectedLevel,
+                items: ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']
+                    .map((level) => DropdownMenuItem(
+                          value: level,
+                          child: Text(level),
+                        ))
+                    .toList(),
+                onChanged: (value) {
+                  if (value != null) {
+                    selectedLevel = value;
+                  }
+                },
+                decoration: const InputDecoration(labelText: 'Log Level'),
+              ),
+              const SizedBox(height: 16),
+              TextFormField(
+                controller: messageController,
+                decoration: const InputDecoration(
+                  labelText: 'Log Message',
+                  hintText: 'Enter test message',
+                ),
+                maxLines: 3,
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () async {
+              Navigator.pop(context);
+              _showMessage('Sending custom log...');
+              
+              setState(() {
+                _isTesting = true;
+              });
+              
+              final success = await _logSender.sendCustomLog(
+                serverUrl,
+                apiKey,
+                messageController.text,
+                selectedLevel,
+              );
+              
+              setState(() {
+                _isTesting = false;
+              });
+              
+              if (success) {
+                _showMessage('Custom log sent successfully');
+              } else {
+                _showMessage('Failed to send custom log', isError: true);
+              }
+            },
+            child: const Text('Send'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showVerificationInstructions() {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Verify on Wazuh Server'),
+        content: SingleChildScrollView(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text('To verify logs reached Wazuh:'),
+              const SizedBox(height: 16),
+              const Text('1. On Wazuh server (192.168.0.117), run:'),
+              const SizedBox(height: 8),
+              Container(
+                padding: const EdgeInsets.all(12),
+                color: Colors.black87,
+                child: const SelectableText(
+                  '# Check if logs appear in archives\n'
+                  'sudo tail -f /var/ossec/logs/archives/archives.log | grep -i mhf\n\n'
+                  '# Check alerts\n'
+                  'sudo tail -f /var/ossec/logs/alerts/alerts.log | grep -i mhf',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontFamily: 'Monospace',
+                    fontSize: 12,
+                  ),
+                ),
+              ),
+              const SizedBox(height: 16),
+              const Text('2. Check Wazuh dashboard:'),
+              const Text('   • Go to Security Events'),
+              const Text('   • Filter by: app_name:MHF_Log_Shield'),
+              const Text('   • Or search for: MHFLogShield'),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('OK'),
+          ),
+        ],
+      ),
+    );
   }
 
   void _toggleCollection() {
@@ -238,6 +471,7 @@ class _HomeScreenState extends State<HomeScreen> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
+        // Configure/Start-Stop Button
         if (_isConfigured)
           ElevatedButton(
             onPressed: _isTesting ? null : _toggleCollection,
@@ -290,6 +524,7 @@ class _HomeScreenState extends State<HomeScreen> {
         
         const SizedBox(height: 12),
         
+        // Test Connection Button
         ElevatedButton.icon(
           onPressed: _isTesting ? null : _testConnection,
           icon: _isTesting
@@ -312,6 +547,30 @@ class _HomeScreenState extends State<HomeScreen> {
         
         const SizedBox(height: 12),
         
+        // Send Test Log Button
+        ElevatedButton.icon(
+          onPressed: _isTesting ? null : _sendTestLog,
+          icon: const Icon(Icons.send),
+          label: const Text('Send Test Log'),
+          style: ElevatedButton.styleFrom(
+            minimumSize: const Size(double.infinity, 50),
+            backgroundColor: Colors.purple,
+            disabledBackgroundColor: Colors.grey,
+          ),
+        ),
+        
+        const SizedBox(height: 12),
+        
+        // Multiple Format Test Button
+        OutlinedButton.icon(
+          onPressed: _isTesting ? null : _sendMultipleTestLogs,
+          icon: const Icon(Icons.format_list_bulleted, size: 18),
+          label: const Text('Test Multiple Formats'),
+        ),
+        
+        const SizedBox(height: 12),
+        
+        // Manual Sync Button
         ElevatedButton.icon(
           onPressed: () {
             _showMessage('Manual sync feature coming soon');
@@ -321,6 +580,15 @@ class _HomeScreenState extends State<HomeScreen> {
           style: ElevatedButton.styleFrom(
             minimumSize: const Size(double.infinity, 50),
           ),
+        ),
+        
+        const SizedBox(height: 12),
+        
+        // Custom Log Button
+        OutlinedButton.icon(
+          onPressed: _isTesting ? null : _sendCustomLog,
+          icon: const Icon(Icons.edit, size: 18),
+          label: const Text('Custom Log'),
         ),
       ],
     );
@@ -346,16 +614,26 @@ class _HomeScreenState extends State<HomeScreen> {
             _buildStatusRow('Log Collection', _isCollecting ? 'Active' : 'Inactive'),
             const SizedBox(height: 12),
             const Text(
-              'Connection Information:',
+              'Log Testing:',
               style: TextStyle(
                 fontWeight: FontWeight.bold,
                 fontSize: 14,
               ),
             ),
             const SizedBox(height: 8),
-            const Text('• UDP mode: Port 1514 (no authentication)'),
-            const Text('• REST API mode: Port 55000 (requires API key)'),
-            const Text('• Test connection sends actual packet to server'),
+            const Text('• "Send Test Log": Tries 4 different formats'),
+            const Text('• "Test Multiple Formats": Sends 3 formats separately'),
+            const Text('• "Custom Log": Send specific messages'),
+            const SizedBox(height: 8),
+            const Text(
+              'To verify on Wazuh:',
+              style: TextStyle(
+                fontWeight: FontWeight.bold,
+                fontSize: 14,
+              ),
+            ),
+            const Text('sudo tail -f /var/ossec/logs/archives/archives.log'),
+            const Text('Filter by: MHFLogShield or mobile-device'),
           ],
         ),
       ),

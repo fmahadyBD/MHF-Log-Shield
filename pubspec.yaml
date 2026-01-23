@@ -16,7 +16,15 @@ dependencies:
 
   # Keep shared_preferences for settings
   http: ^1.6.0
-  shared_preferences: ^2.2.2
+  device_apps: ^2.2.1        # Get installed apps
+  package_info_plus: ^4.1.0   # App info
+  device_info_plus: ^9.1.1    # Device info
+  workmanager: ^0.5.1         # Background tasks
+  background_fetch: ^1.0.0    # Periodic fetch
+  connectivity_plus: ^5.0.1   # Network status
+  battery_plus: ^3.0.3        # Battery info
+  shared_preferences: ^2.2.2  # Store logs locally
+  path_provider: ^2.1.0       # File storage
 
 dev_dependencies:
   flutter_test:
