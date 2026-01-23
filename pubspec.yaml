@@ -1,5 +1,5 @@
 name: mhf_log_shield
-description: "Wazuh Log Forwarder with offline capability"
+description: "Android log forwarder for Wazuh"
 publish_to: 'none'
 version: 1.0.0+1
 
@@ -9,7 +9,13 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  # We'll add packages one by one as we need them
+
+  # Remove sqflite for now
+  # sqflite: ^2.3.0
+  # path: ^1.9.0
+
+  # Keep shared_preferences for settings
+  shared_preferences: ^2.2.2
 
 dev_dependencies:
   flutter_test:
