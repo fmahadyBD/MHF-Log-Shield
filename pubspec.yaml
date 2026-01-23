@@ -15,6 +15,7 @@ dependencies:
   # path: ^1.9.0
 
   # Keep shared_preferences for settings
+  http: ^1.6.0
   shared_preferences: ^2.2.2
 
 dev_dependencies:

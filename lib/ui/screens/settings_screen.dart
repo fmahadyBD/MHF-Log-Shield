@@ -21,10 +21,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
   @override
   void initState() {
     super.initState();
-    _loadSettings();
+    _loadCurrentSettings();
   }
 
-  Future<void> _loadSettings() async {
+  Future<void> _loadCurrentSettings() async {
     await _settings.initialize();
     
     setState(() {
@@ -42,9 +42,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
     await _settings.setAutoSync(_autoSync);
     await _settings.setCollectLogs(_collectLogs);
     
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Settings saved!')),
-    );
+    // Show success message
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Settings saved successfully!'),
+          backgroundColor: Colors.green,
+        ),
+      );
+    }
     
     Navigator.pop(context);
   }
@@ -64,87 +70,130 @@ class _SettingsScreenState extends State<SettingsScreen> {
           IconButton(
             icon: const Icon(Icons.save),
             onPressed: _saveSettings,
+            tooltip: 'Save Settings',
           ),
         ],
       ),
-      body: Padding(
-        padding: const EdgeInsets.all(16.0),
-        child: ListView(
-          children: [
-            Card(
-              child: Padding(
-                padding: const EdgeInsets.all(16.0),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text(
-                      'Wazuh Server',
-                      style: TextStyle(
-                        fontSize: 18,
-                        fontWeight: FontWeight.bold,
-                      ),
+      body: _buildSettingsForm(),
+    );
+  }
+
+  Widget _buildSettingsForm() {
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        children: [
+          // Wazuh Server Section
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'Wazuh Server Configuration',
+                    style: TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
                     ),
-                    const SizedBox(height: 16),
-                    TextField(
-                      controller: _serverUrlController,
-                      decoration: const InputDecoration(
-                        labelText: 'Server URL',
-                        hintText: 'http://192.168.1.100:55000',
-                        border: OutlineInputBorder(),
-                      ),
+                  ),
+                  const SizedBox(height: 20),
+                  TextField(
+                    controller: _serverUrlController,
+                    decoration: const InputDecoration(
+                      labelText: 'Server Address',
+                      hintText: '192.168.1.100 or 192.168.1.100:1514',
+                      border: OutlineInputBorder(),
+                      prefixIcon: Icon(Icons.dns),
                     ),
-                    const SizedBox(height: 12),
-                    TextField(
-                      controller: _apiKeyController,
-                      obscureText: true,
-                      decoration: const InputDecoration(
-                        labelText: 'API Key (Optional)',
-                        border: OutlineInputBorder(),
-                      ),
+                  ),
+                  const SizedBox(height: 16),
+                  TextField(
+                    controller: _apiKeyController,
+                    decoration: const InputDecoration(
+                      labelText: 'API Key (Optional)',
+                      hintText: 'Leave empty for UDP mode',
+                      border: OutlineInputBorder(),
+                      prefixIcon: Icon(Icons.key),
                     ),
-                  ],
-                ),
+                    obscureText: true,
+                  ),
+                  const SizedBox(height: 10),
+                  const Text(
+                    'Note: Empty API key = UDP mode (port 1514)\n'
+                    'With API key = REST API mode (port 55000)',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: Colors.grey,
+                      fontStyle: FontStyle.italic,
+                    ),
+                  ),
+                ],
               ),
             ),
-            const SizedBox(height: 16),
-            Card(
-              child: Padding(
-                padding: const EdgeInsets.all(16.0),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text(
-                      'App Settings',
-                      style: TextStyle(
-                        fontSize: 18,
-                        fontWeight: FontWeight.bold,
-                      ),
+          ),
+          
+          const SizedBox(height: 20),
+          
+          // App Settings Section
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'App Settings',
+                    style: TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
                     ),
-                    const SizedBox(height: 16),
-                    SwitchListTile(
-                      title: const Text('Auto Sync'),
-                      value: _autoSync,
-                      onChanged: (value) {
-                        setState(() {
-                          _autoSync = value;
-                        });
-                      },
-                    ),
-                    SwitchListTile(
-                      title: const Text('Collect Logs'),
-                      value: _collectLogs,
-                      onChanged: (value) {
-                        setState(() {
-                          _collectLogs = value;
-                        });
-                      },
-                    ),
-                  ],
-                ),
+                  ),
+                  const SizedBox(height: 20),
+                  SwitchListTile(
+                    title: const Text('Auto Sync'),
+                    subtitle: const Text('Automatically sync logs with server'),
+                    value: _autoSync,
+                    onChanged: (value) {
+                      setState(() {
+                        _autoSync = value;
+                      });
+                    },
+                  ),
+                  SwitchListTile(
+                    title: const Text('Collect Logs'),
+                    subtitle: const Text('Start collecting logs automatically'),
+                    value: _collectLogs,
+                    onChanged: (value) {
+                      setState(() {
+                        _collectLogs = value;
+                      });
+                    },
+                  ),
+                ],
               ),
             ),
-          ],
-        ),
+          ),
+          
+          const SizedBox(height: 30),
+          
+          // Save Button
+          SizedBox(
+            width: double.infinity,
+            child: ElevatedButton.icon(
+              onPressed: _saveSettings,
+              icon: const Icon(Icons.save),
+              label: const Text(
+                'Save Settings',
+                style: TextStyle(fontSize: 16),
+              ),
+              style: ElevatedButton.styleFrom(
+                padding: const EdgeInsets.symmetric(vertical: 16),
+                backgroundColor: Colors.blue,
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
