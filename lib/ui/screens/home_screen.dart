@@ -201,7 +201,7 @@ class _HomeScreenState extends State<HomeScreen> {
             mainAxisSize: MainAxisSize.min,
             children: [
               DropdownButtonFormField<String>(
-                value: selectedLevel,
+                initialValue: selectedLevel,
                 items: ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']
                     .map((level) => DropdownMenuItem(
                           value: level,

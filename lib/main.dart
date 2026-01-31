@@ -1,7 +1,13 @@
 import 'package:flutter/material.dart';
 import 'package:mhf_log_shield/ui/screens/home_screen.dart';
+import 'package:mhf_log_shield/services/background_logger.dart';
 
 void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  
+  // Initialize background tasks
+  BackgroundLogger.initialize();
+  
   runApp(const MyApp());
 }
 
@@ -16,7 +22,7 @@ class MyApp extends StatelessWidget {
         primarySwatch: Colors.blue,
         useMaterial3: true,
       ),
-      home: const HomeScreen(), // This imports from the separate file
+      home: const HomeScreen(),
     );
   }
 }

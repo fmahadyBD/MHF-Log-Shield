@@ -16,7 +16,7 @@ dependencies:
 
   # Keep shared_preferences for settings
   http: ^1.6.0
-  device_apps: ^2.2.1        # Get installed apps
+  device_apps: ^2.2.0        # Get installed apps
   package_info_plus: ^4.1.0   # App info
   device_info_plus: ^9.1.1    # Device info
   workmanager: ^0.5.1         # Background tasks
