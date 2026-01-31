@@ -1,15 +1,21 @@
 <?xml version="1.0" encoding="utf-8"?>
 <network-security-config>
-    <!-- Allow non-HTTPS traffic (cleartext) for local network addresses -->
+    <!-- Allow cleartext traffic for UDP logging -->
     <domain-config cleartextTrafficPermitted="true">
-        <!-- Your Wazuh server IP -->
-        <domain includeSubdomains="true">192.168.0.101</domain>
-        <domain includeSubdomains="true">192.168.0.117</domain>
-        <!-- Local testing -->
         <domain includeSubdomains="true">localhost</domain>
         <domain includeSubdomains="true">127.0.0.1</domain>
-        <!-- Allow any local network IP (192.168.x.x, 10.x.x.x, 172.16.x.x) -->
+        <!-- Add your local network IP ranges -->
         <domain includeSubdomains="true">192.168.0.0</domain>
+        <domain includeSubdomains="true">192.168.1.0</domain>
         <domain includeSubdomains="true">10.0.0.0</domain>
+        <domain includeSubdomains="true">172.16.0.0</domain>
     </domain-config>
+    
+    <!-- Base configuration -->
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="user" />
+        </trust-anchors>
+    </base-config>
 </network-security-config>

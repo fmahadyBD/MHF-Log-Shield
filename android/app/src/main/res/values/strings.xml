@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Your existing strings -->
+    <string name="app_name">MHF Log Shield</string>
+    
+    <!-- Add these missing strings -->
+    <string name="accessibility_service_description">Used to detect app foreground changes for monitoring</string>
+    
+    <!-- Add any other strings you might need -->
+    <string name="default_notification_channel_id">mhf_notifications</string>
+    <string name="default_notification_channel_name">MHF Notifications</string>
+</resources>

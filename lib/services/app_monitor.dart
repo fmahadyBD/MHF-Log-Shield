@@ -28,7 +28,7 @@ class AppMonitor {
   
   // Stream subscriptions for cleanup
   StreamSubscription<BatteryState>? _batterySubscription;
-  StreamSubscription<ConnectivityResult>? _connectivitySubscription;
+  StreamSubscription<List<ConnectivityResult>>? _connectivitySubscription;
 
   AppMonitor(this._settings, this._logSender);
 
@@ -216,7 +216,7 @@ class AppMonitor {
       // Get app details
       final appWithData = await DeviceApps.getApp(app.packageName);
       final version = appWithData?.versionName ?? 'Unknown';
-      final versionCode = appWithData?.versionCode.toString() ?? 'Unknown';
+      final versionCode = appWithData?.versionCode?.toString() ?? 'Unknown';
       
       // Get install source
       final installSource = await _getInstallSource(app.packageName);
@@ -263,7 +263,7 @@ class AppMonitor {
     
     try {
       final appWithData = await DeviceApps.getApp(app.packageName);
-      final versionCode = appWithData?.versionCode.toString() ?? 'Unknown';
+      final versionCode = appWithData?.versionCode?.toString() ?? 'Unknown';
       final installSource = _appInstallSources[app.packageName] ?? 'Unknown';
       
       final appType = app.systemApp ? 'System App' : 'User App';
@@ -385,8 +385,10 @@ class AppMonitor {
       });
       
       // Monitor network changes
-      _connectivitySubscription = _connectivity.onConnectivityChanged.listen((ConnectivityResult result) async {
-        await _logNetworkChange(result);
+      _connectivitySubscription = _connectivity.onConnectivityChanged.listen((List<ConnectivityResult> results) async {
+        if (results.isNotEmpty) {
+          await _logNetworkChange(results.first);
+        }
       });
       
     } catch (e) {
@@ -446,12 +448,14 @@ class AppMonitor {
     
     try {
       final batteryLevel = await _battery.batteryLevel;
-      final networkResult = await _connectivity.checkConnectivity();
-      final networkStr = networkResult != ConnectivityResult.none
-          ? _getNetworkTypeString(networkResult)
+      final networkResults = await _connectivity.checkConnectivity();
+      final networkStr = networkResults.isNotEmpty 
+          ? _getNetworkTypeString(networkResults.first)
           : 'No Connection';
       final appCount = _previousApps.length;
-      final message = 'Apps: $appCount | '
+      
+      final message = '📊 Status Update | '
+                      'Apps: $appCount | '
                       'Battery: $batteryLevel% | '
                       'Network: $networkStr';
       
@@ -614,7 +618,8 @@ class AppMonitor {
   /// Get current network status
   Future<Map<String, dynamic>> getNetworkStatus() async {
     try {
-      final result = await _connectivity.checkConnectivity();
+      final results = await _connectivity.checkConnectivity();
+      final result = results.isNotEmpty ? results.first : ConnectivityResult.none;
       
       return {
         'type': result.name,
@@ -630,4 +635,19 @@ class AppMonitor {
       };
     }
   }
+
+
+
+  // In AppMonitor class (where you have the MethodChannel)
+static Future<void> saveServerUrlForNative(String serverUrl) async {
+  try {
+    const platform = MethodChannel('app_monitor_channel'); // Use your existing channel
+    await platform.invokeMethod('saveServerUrl', {'url': serverUrl});
+    print('[AppMonitor] Server URL saved for native components: $serverUrl');
+  } catch (e) {
+    print('[AppMonitor] Error saving server URL: $e');
+  }
+}
+
+
 }

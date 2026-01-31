@@ -1,32 +1,16 @@
-# MHF Log Shield
----
+# mhf_log_shield
 
-## Wazuh Log Forwarder - Flutter Application
+A new Flutter project.
 
-A Flutter application that collects Android logs and forwards them to a Wazuh server with offline capability and automatic synchronization.
+## Getting Started
 
-## Features
+This project is a starting point for a Flutter application.
 
-- Real-time Android logcat collection
-- Manual Wazuh server configuration
-- Offline log storage with SQLite
-- Automatic sync when reconnected
-- Background service for periodic sync
-- Material Design 3 UI
-- Dark/Light theme support
+A few resources to get you started if this is your first Flutter project:
 
-## Installation
+- [Lab: Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
+- [Cookbook: Useful Flutter samples](https://docs.flutter.dev/cookbook)
 
-### Prerequisites
-- Flutter SDK 3.0.0 or higher
-- Android Studio
-- Wazuh server running and accessible
-
-### Setup
-
-1. Clone the repository:
-
-```bash
-git clone https://github.com/fmahadyBD/MHF-Log-Shield.git
-cd MHF-Log-Shield
-``
+For help getting started with Flutter development, view the
+[online documentation](https://docs.flutter.dev/), which offers tutorials,
+samples, guidance on mobile development, and a full API reference.
