@@ -1,18 +1,22 @@
 import 'package:flutter/material.dart';
-import 'package:mhf_log_shield/ui/screens/home_screen.dart';
+import 'package:mhf_log_shield/core/platform/platform_service_factory.dart';
 import 'package:mhf_log_shield/services/background_logger.dart';
+import 'package:mhf_log_shield/ui/screens/home_screen.dart';
 
-void main() {
+void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   
-  // Initialize background tasks
+  // Initialize platform services
+  await PlatformServiceFactory.initializePlatformServices();
+  
+  // Initialize background logger
   BackgroundLogger.initialize();
   
-  runApp(const MyApp());
+  runApp(const MhfLogShieldApp());
 }
 
-class MyApp extends StatelessWidget {
-  const MyApp({super.key});
+class MhfLogShieldApp extends StatelessWidget {
+  const MhfLogShieldApp({super.key});
 
   @override
   Widget build(BuildContext context) {

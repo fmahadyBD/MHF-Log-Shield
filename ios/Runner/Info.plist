@@ -22,6 +22,33 @@
 	<string>????</string>
 	<key>CFBundleVersion</key>
 	<string>$(FLUTTER_BUILD_NUMBER)</string>
+	
+	<!-- ============ CRITICAL ADDITIONS START ============ -->
+	<!-- 1. APP TRANSPORT SECURITY - REQUIRED for HTTP/UDP -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+	</dict>
+	
+	<!-- 2. PRIVACY DESCRIPTIONS - REQUIRED for network access -->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Required for network monitoring and log sending to Wazuh server</string>
+	
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_services._dns-sd._udp</string>
+		<string>_http._tcp</string>
+	</array>
+	
+	<!-- 3. BACKGROUND MODES (Optional but recommended) -->
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>fetch</string>
+		<string>processing</string>
+	</array>
+	<!-- ============ CRITICAL ADDITIONS END ============ -->
+	
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>UILaunchStoryboardName</key>

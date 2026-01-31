@@ -8,6 +8,10 @@ import 'package:workmanager/workmanager.dart';
 // Storage package
 import 'package:shared_preferences/shared_preferences.dart';
 
+// Core imports
+import 'package:mhf_log_shield/core/interfaces/platform_services.dart';
+import 'package:mhf_log_shield/core/platform/platform_service_factory.dart';
+
 // Device monitoring packages
 import 'package:device_apps/device_apps.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
@@ -21,18 +25,25 @@ import 'package:mhf_log_shield/data/repositories/settings_repository.dart';
 class BackgroundLogger {
   static const String _logStorageKey = 'pending_logs';
   static const String _appEventsKey = 'app_events';
+  static final PlatformServices _platformServices = 
+      PlatformServiceFactory.getPlatformServices();
 
-  /// Initialize background work manager
+  /// Initialize background work manager (cross-platform)
   static void initialize() {
-    Workmanager().initialize(
-      callbackDispatcher,
-      isInDebugMode: true, // Set to false in production
-    );
-
-    print('[BackgroundLogger] Initialized');
+    // Only initialize Workmanager on platforms that support it
+    if (_platformServices.canRunBackgroundTasks()) {
+      Workmanager().initialize(
+        callbackDispatcher,
+        isInDebugMode: true, // Set to false in production
+      );
+      
+      print('[BackgroundLogger] Background work manager initialized');
+    } else {
+      print('[BackgroundLogger] Background tasks not supported on ${_platformServices.getPlatformName()}');
+    }
   }
 
-  // Add this method to actually start sending logs
+  /// Start continuous logging (cross-platform)
   static Future<void> startLogging() async {
     final settings = SettingsRepository();
     await settings.initialize();
@@ -48,7 +59,7 @@ class BackgroundLogger {
       return;
     }
 
-    print('[BackgroundLogger] Starting continuous logging...');
+    print('[BackgroundLogger] Starting continuous logging on ${_platformServices.getPlatformName()}...');
 
     // Start periodic logging
     await _startPeriodicLogging(serverUrl);
@@ -64,8 +75,10 @@ class BackgroundLogger {
       }
     });
 
-    // Also start app monitoring
-    await _startAppMonitoring(serverUrl);
+    // Also start app monitoring if platform supports it
+    if (_platformServices.canMonitorAppInstalls()) {
+      await _startAppMonitoring(serverUrl);
+    }
   }
 
   static Future<void> _sendPeriodicLog(String serverUrl) async {
@@ -95,8 +108,11 @@ class BackgroundLogger {
           networkType = 'No Connection';
       }
 
+      final platform = _platformServices.getPlatformName();
       final message =
-          '📱 Periodic Check | Battery: $batteryLevel% | Network: $networkType';
+          '📱 Background Check | Platform: $platform | '
+          'Battery: $batteryLevel% | '
+          'Network: $networkType';
 
       await logSender.sendCustomLog(serverUrl, '', message, 'INFO');
       print('[BackgroundLogger] Sent periodic log');
@@ -115,7 +131,7 @@ class BackgroundLogger {
       final appCount = apps.length;
 
       // Log initial app count
-      final message = '📊 Initial App Count | Total Apps: $appCount';
+      final message = '📊 Background App Count | Total Apps: $appCount';
       await logSender.sendCustomLog(serverUrl, '', message, 'INFO');
 
       print('[BackgroundLogger] Initial app count logged: $appCount');
@@ -124,51 +140,70 @@ class BackgroundLogger {
     }
   }
 
+  /// Start background monitoring tasks (platform-specific)
   static Future<void> startBackgroundMonitoring() async {
-    // Start foreground service for Android 8+
-    if (Platform.isAndroid) {
+    print('[BackgroundLogger] Starting background monitoring on ${_platformServices.getPlatformName()}');
+    
+    // Start platform-specific services
+    if (_platformServices.canRunForegroundService()) {
       try {
-        const platform = MethodChannel('app_monitor_channel');
-        await platform.invokeMethod('startForegroundService');
+        await _platformServices.startForegroundService();
       } catch (e) {
         print('[BackgroundLogger] Error starting foreground service: $e');
       }
     }
 
-    // Register periodic task (every 15 minutes - minimum allowed)
-    await Workmanager().registerPeriodicTask(
-      "logSyncTask",
-      "logSync",
-      frequency: const Duration(minutes: 15),
-      constraints: Constraints(
-        networkType: NetworkType.connected,
-        requiresBatteryNotLow: false,
-        requiresCharging: false,
-        requiresDeviceIdle: false,
-        requiresStorageNotLow: false,
-      ),
-      initialDelay: const Duration(seconds: 30),
-      existingWorkPolicy: ExistingPeriodicWorkPolicy.replace,
-    );
-
-    print('[BackgroundLogger] Background tasks registered');
+    // Register periodic task if platform supports it
+    if (_platformServices.canRunBackgroundTasks()) {
+      try {
+        await Workmanager().registerPeriodicTask(
+          "logSyncTask",
+          "logSync",
+          frequency: const Duration(minutes: 15),
+          constraints: Constraints(
+            networkType: NetworkType.connected,
+            requiresBatteryNotLow: false,
+            requiresCharging: false,
+            requiresDeviceIdle: false,
+            requiresStorageNotLow: false,
+          ),
+          initialDelay: const Duration(seconds: 30),
+          existingWorkPolicy: ExistingPeriodicWorkPolicy.replace,
+        );
+        
+        print('[BackgroundLogger] Background tasks registered');
+      } catch (e) {
+        print('[BackgroundLogger] Error registering background tasks: $e');
+      }
+    } else {
+      print('[BackgroundLogger] Background tasks not supported on this platform');
+    }
   }
 
   static Future<void> stopBackgroundMonitoring() async {
-    if (Platform.isAndroid) {
+    print('[BackgroundLogger] Stopping background monitoring');
+    
+    // Stop platform services
+    if (_platformServices.canRunForegroundService()) {
       try {
-        const platform = MethodChannel('app_monitor_channel');
-        await platform.invokeMethod('stopForegroundService');
+        await _platformServices.stopForegroundService();
       } catch (e) {
         print('[BackgroundLogger] Error stopping foreground service: $e');
       }
     }
 
-    await Workmanager().cancelAll();
-    print('[BackgroundLogger] All background tasks cancelled');
+    // Cancel background tasks
+    if (_platformServices.canRunBackgroundTasks()) {
+      try {
+        await Workmanager().cancelAll();
+        print('[BackgroundLogger] All background tasks cancelled');
+      } catch (e) {
+        print('[BackgroundLogger] Error cancelling background tasks: $e');
+      }
+    }
   }
 
-  /// Store log when device is offline
+  /// Store log when device is offline (cross-platform)
   static Future<void> storeLogOffline(String log) async {
     try {
       final prefs = await SharedPreferences.getInstance();
@@ -191,7 +226,7 @@ class BackgroundLogger {
     }
   }
 
-  /// Send all pending logs when device comes online
+  /// Send all pending logs when device comes online (cross-platform)
   static Future<void> sendPendingLogs() async {
     try {
       final prefs = await SharedPreferences.getInstance();
@@ -266,7 +301,7 @@ class BackgroundLogger {
     }
   }
 
-  /// Store app event for offline tracking
+  /// Store app event for offline tracking (cross-platform)
   static Future<void> storeAppEventOffline(
     String event,
     String appName,
@@ -292,7 +327,7 @@ class BackgroundLogger {
     }
   }
 
-  /// Get pending logs count
+  /// Get pending logs count (cross-platform)
   static Future<int> getPendingLogsCount() async {
     try {
       final prefs = await SharedPreferences.getInstance();
@@ -304,7 +339,7 @@ class BackgroundLogger {
     }
   }
 
-  /// Get app events count
+  /// Get app events count (cross-platform)
   static Future<int> getAppEventsCount() async {
     try {
       final prefs = await SharedPreferences.getInstance();
@@ -316,7 +351,7 @@ class BackgroundLogger {
     }
   }
 
-  /// Clear all stored logs (for testing/reset)
+  /// Clear all stored logs (for testing/reset) (cross-platform)
   static Future<void> clearAllStoredLogs() async {
     try {
       final prefs = await SharedPreferences.getInstance();
@@ -329,7 +364,7 @@ class BackgroundLogger {
   }
 }
 
-/// Callback dispatcher for background tasks
+/// Callback dispatcher for background tasks (cross-platform)
 @pragma('vm:entry-point')
 void callbackDispatcher() {
   Workmanager().executeTask((task, inputData) async {
@@ -356,7 +391,7 @@ void callbackDispatcher() {
   });
 }
 
-/// Execute log synchronization task
+/// Execute log synchronization task (cross-platform)
 Future<void> _executeLogSync() async {
   print('[BackgroundTask] Executing log sync');
 
@@ -372,8 +407,11 @@ Future<void> _executeLogSync() async {
       // Send device status
       await _sendDeviceStatus(settings);
 
-      // Check for app changes
-      await _checkForAppChanges(settings);
+      // Check for app changes if platform supports it
+      final platformServices = PlatformServiceFactory.getPlatformServices();
+      if (platformServices.canMonitorAppInstalls()) {
+        await _checkForAppChanges(settings);
+      }
     }
 
     print('[BackgroundTask] Log sync completed');
@@ -382,7 +420,7 @@ Future<void> _executeLogSync() async {
   }
 }
 
-/// Execute start monitoring task
+/// Execute start monitoring task (cross-platform)
 Future<void> _executeStartMonitoring() async {
   print('[BackgroundTask] Executing start monitoring');
 
@@ -401,7 +439,7 @@ Future<void> _executeStartMonitoring() async {
   }
 }
 
-/// Send current device status
+/// Send current device status (cross-platform)
 Future<void> _sendDeviceStatus(SettingsRepository settings) async {
   final serverUrl = settings.getServerUrl();
   if (serverUrl.isEmpty) return;
@@ -415,7 +453,7 @@ Future<void> _sendDeviceStatus(SettingsRepository settings) async {
     final networkResults = await connectivity.checkConnectivity();
     final batteryState = await battery.batteryState;
 
-    // Get network type string - FIXED: Handle List<ConnectivityResult>
+    // Get network type
     final networkStatus = networkResults.isNotEmpty
         ? networkResults.first
         : ConnectivityResult.none;
@@ -460,8 +498,12 @@ Future<void> _sendDeviceStatus(SettingsRepository settings) async {
         batteryStateStr = 'Unknown';
     }
 
+    final platformServices = PlatformServiceFactory.getPlatformServices();
+    final platform = platformServices.getPlatformName();
+    
     final message =
-        '📱 Device Status | '
+        '📱 Background Status | '
+        'Platform: $platform | '
         'Battery: $batteryLevel% ($batteryStateStr) | '
         'Network: $networkType';
 
@@ -473,7 +515,7 @@ Future<void> _sendDeviceStatus(SettingsRepository settings) async {
   }
 }
 
-/// Check for app changes in background
+/// Check for app changes in background (Android only)
 Future<void> _checkForAppChanges(SettingsRepository settings) async {
   final serverUrl = settings.getServerUrl();
   if (serverUrl.isEmpty) return;
@@ -483,7 +525,7 @@ Future<void> _checkForAppChanges(SettingsRepository settings) async {
     final appCount = currentApps.length;
 
     final logSender = LogSender();
-    final message = '📊 App Count Check | Total Apps: $appCount';
+    final message = '📊 Background App Count | Total Apps: $appCount';
 
     await logSender.sendCustomLog(serverUrl, '', message, 'INFO');
 
@@ -493,23 +535,20 @@ Future<void> _checkForAppChanges(SettingsRepository settings) async {
   }
 }
 
-/// Log device information
+/// Log device information (cross-platform)
 Future<void> _logDeviceInformation(SettingsRepository settings) async {
   final serverUrl = settings.getServerUrl();
   if (serverUrl.isEmpty) return;
 
   try {
-    final deviceInfo = DeviceInfoPlugin();
+    final platformServices = PlatformServiceFactory.getPlatformServices();
+    final deviceInfo = await platformServices.getDeviceInfo();
+    final platform = platformServices.getPlatformName();
+
     final logSender = LogSender();
-
-    final androidInfo = await deviceInfo.androidInfo;
-
-    final message =
-        '📱 Device Information | '
-        'Model: ${androidInfo.model} | '
-        'Android: ${androidInfo.version.release} (SDK ${androidInfo.version.sdkInt}) | '
-        'Brand: ${androidInfo.brand} | '
-        'Manufacturer: ${androidInfo.manufacturer}';
+    final message = '📱 Background Device Info | '
+                    'Platform: $platform | '
+                    'Device: ${deviceInfo['model'] ?? deviceInfo['name'] ?? 'Unknown'}';
 
     await logSender.sendCustomLog(serverUrl, '', message, 'INFO');
 

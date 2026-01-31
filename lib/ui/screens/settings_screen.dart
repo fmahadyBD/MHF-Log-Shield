@@ -1,6 +1,10 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:mhf_log_shield/core/interfaces/platform_services.dart';
+import 'package:mhf_log_shield/core/platform/platform_service_factory.dart';
 import 'package:mhf_log_shield/data/repositories/settings_repository.dart';
+import 'package:mhf_log_shield/ui/screens/home_screen.dart';
+import 'package:mhf_log_shield/utils/connection_tester.dart';
 
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
@@ -11,7 +15,7 @@ class SettingsScreen extends StatefulWidget {
 
 class _SettingsScreenState extends State<SettingsScreen> {
   final SettingsRepository _settings = SettingsRepository();
-  static const MethodChannel _channel = MethodChannel('app_monitor_channel');
+  final PlatformServices _platformServices = PlatformServiceFactory.getPlatformServices();
   
   final TextEditingController _serverUrlController = TextEditingController();
   final TextEditingController _apiKeyController = TextEditingController();
@@ -20,10 +24,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool _collectLogs = false;
   bool _isLoading = true;
   bool _isSaving = false;
+  String _platformName = 'Unknown';
 
   @override
   void initState() {
     super.initState();
+    _platformName = _platformServices.getPlatformName();
     _loadCurrentSettings();
   }
 
@@ -63,10 +69,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
       await _settings.setAutoSync(_autoSync);
       await _settings.setCollectLogs(_collectLogs);
       
-      // NEW: Also save server URL for native components
+      // Also save server URL for native components
       if (serverUrl.isNotEmpty) {
         try {
-          await _channel.invokeMethod('saveServerUrl', {'url': serverUrl});
+          await _platformServices.saveServerUrl(serverUrl);
           print('[SettingsScreen] Server URL saved for native components');
         } catch (e) {
           print('[SettingsScreen] Error saving URL to native: $e');
@@ -152,7 +158,27 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Settings'),
+        title: Row(
+          children: [
+            const Text('Settings'),
+            const SizedBox(width: 8),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+              decoration: BoxDecoration(
+                color: _getPlatformColor(),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Text(
+                _platformName,
+                style: const TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.white,
+                ),
+              ),
+            ),
+          ],
+        ),
         actions: [
           IconButton(
             icon: _isSaving 
@@ -174,11 +200,87 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
+  Color _getPlatformColor() {
+    switch (_platformName) {
+      case 'Android':
+        return Colors.green;
+      case 'iOS':
+        return Colors.blue;
+      case 'Linux':
+        return Colors.orange;
+      case 'Windows':
+        return Colors.blueAccent;
+      case 'macOS':
+        return Colors.grey;
+      default:
+        return Colors.grey;
+    }
+  }
+
   Widget _buildSettingsForm() {
     return SingleChildScrollView(
       padding: const EdgeInsets.all(16),
       child: Column(
         children: [
+          // Platform Info Card
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                children: [
+                  Row(
+                    children: [
+                      _buildPlatformIcon(),
+                      const SizedBox(width: 16),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              _platformName,
+                              style: const TextStyle(
+                                fontSize: 18,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              _getPlatformDescription(),
+                              style: const TextStyle(
+                                fontSize: 12,
+                                color: Colors.grey,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 16),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                    children: [
+                      _buildCapabilityChip(
+                        'App Monitoring',
+                        _platformServices.canMonitorAppInstalls(),
+                      ),
+                      _buildCapabilityChip(
+                        'Screen Monitoring',
+                        _platformServices.canMonitorScreenState(),
+                      ),
+                      _buildCapabilityChip(
+                        'Power Monitoring',
+                        _platformServices.canMonitorPower(),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ),
+          
+          const SizedBox(height: 20),
+          
           // Wazuh Server Section
           Card(
             child: Padding(
@@ -219,9 +321,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     },
                   ),
                   const SizedBox(height: 8),
-                  const Text(
-                    'Default port: 1514 for UDP, 55000 for REST API',
-                    style: TextStyle(
+                  Text(
+                    _platformName == 'iOS' 
+                      ? 'Recommended: Use REST API mode for iOS (port 55000)'
+                      : 'Default port: 1514 for UDP, 55000 for REST API',
+                    style: const TextStyle(
                       fontSize: 12,
                       color: Colors.grey,
                     ),
@@ -238,11 +342,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     obscureText: true,
                   ),
                   const SizedBox(height: 10),
-                  const Text(
-                    'Note: Empty API key = UDP mode (port 1514)\n'
-                    'With API key = REST API mode (port 55000)\n'
-                    'Recommended: Use UDP mode for better performance',
-                    style: TextStyle(
+                  Text(
+                    _platformName == 'iOS'
+                      ? 'Note: iOS works best with REST API mode\n'
+                        'UDP may not work reliably on iOS\n'
+                        'Recommended: Use API key for iOS'
+                      : 'Note: Empty API key = UDP mode (port 1514)\n'
+                        'With API key = REST API mode (port 55000)\n'
+                        'Recommended: Use UDP mode for better performance',
+                    style: const TextStyle(
                       fontSize: 12,
                       color: Colors.grey,
                       fontStyle: FontStyle.italic,
@@ -333,7 +441,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   ),
                   SwitchListTile(
                     title: const Text('Collect Logs'),
-                    subtitle: const Text('Start collecting logs automatically'),
+                    subtitle: Text(
+                      _platformServices.canMonitorAppInstalls()
+                        ? 'Start collecting logs automatically'
+                        : 'Start limited logging (platform restrictions apply)',
+                    ),
                     value: _collectLogs,
                     onChanged: (value) {
                       setState(() {
@@ -341,6 +453,18 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       });
                     },
                   ),
+                  if (!_platformServices.canMonitorAppInstalls())
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 16),
+                      child: Text(
+                        '⚠️ Note: $_platformName has limited monitoring capabilities',
+                        style: const TextStyle(
+                          fontSize: 12,
+                          color: Colors.orange,
+                          fontStyle: FontStyle.italic,
+                        ),
+                      ),
+                    ),
                 ],
               ),
             ),
@@ -391,6 +515,60 @@ class _SettingsScreenState extends State<SettingsScreen> {
         ],
       ),
     );
+  }
+
+  Widget _buildPlatformIcon() {
+    switch (_platformName) {
+      case 'Android':
+        return const Icon(Icons.android, size: 40, color: Colors.green);
+      case 'iOS':
+        return const Icon(Icons.phone_iphone, size: 40, color: Colors.blue);
+      case 'Linux':
+        return const Icon(Icons.computer, size: 40, color: Colors.orange);
+      case 'Windows':
+        return const Icon(Icons.desktop_windows, size: 40, color: Colors.blueAccent);
+      case 'macOS':
+        return const Icon(Icons.desktop_mac, size: 40, color: Colors.grey);
+      default:
+        return const Icon(Icons.device_unknown, size: 40, color: Colors.grey);
+    }
+  }
+
+  Widget _buildCapabilityChip(String label, bool available) {
+    return Column(
+      children: [
+        Icon(
+          available ? Icons.check_circle : Icons.remove_circle,
+          color: available ? Colors.green : Colors.red,
+          size: 24,
+        ),
+        const SizedBox(height: 4),
+        Text(
+          label,
+          style: TextStyle(
+            fontSize: 10,
+            color: available ? Colors.green : Colors.red,
+          ),
+        ),
+      ],
+    );
+  }
+
+  String _getPlatformDescription() {
+    switch (_platformName) {
+      case 'Android':
+        return 'Full monitoring capabilities including app install tracking';
+      case 'iOS':
+        return 'Limited monitoring (Apple restrictions apply)';
+      case 'Linux':
+        return 'Basic monitoring, no app install tracking';
+      case 'Windows':
+        return 'Basic monitoring, no app install tracking';
+      case 'macOS':
+        return 'Basic monitoring, no app install tracking';
+      default:
+        return 'Unknown platform capabilities';
+    }
   }
 
   Future<void> _testConnection() async {
