@@ -1,7 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:mhf_log_shield/core/interfaces/platform_services.dart';
-import 'package:mhf_log_shield/core/platform/platform_service_factory.dart';
+
 import 'package:mhf_log_shield/data/repositories/settings_repository.dart';
 import 'package:mhf_log_shield/ui/screens/home_screen.dart';
 import 'package:mhf_log_shield/utils/connection_tester.dart';
@@ -15,7 +14,7 @@ class SettingsScreen extends StatefulWidget {
 
 class _SettingsScreenState extends State<SettingsScreen> {
   final SettingsRepository _settings = SettingsRepository();
-  final PlatformServices _platformServices = PlatformServiceFactory.getPlatformServices();
+
   
   final TextEditingController _serverUrlController = TextEditingController();
   final TextEditingController _apiKeyController = TextEditingController();
@@ -24,12 +23,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool _collectLogs = false;
   bool _isLoading = true;
   bool _isSaving = false;
-  String _platformName = 'Unknown';
+  bool _isTesting = false;
+
 
   @override
   void initState() {
     super.initState();
-    _platformName = _platformServices.getPlatformName();
+
     _loadCurrentSettings();
   }
 
@@ -48,14 +48,19 @@ class _SettingsScreenState extends State<SettingsScreen> {
   Future<void> _saveSettings() async {
     if (_isSaving) return;
     
-    final serverUrl = _serverUrlController.text.trim();
+    String serverUrl = _serverUrlController.text.trim();
     
-    // Validate server URL if provided
-    if (serverUrl.isNotEmpty) {
-      if (!_isValidServerUrl(serverUrl)) {
-        _showMessage('Invalid server address format', isError: true);
-        return;
-      }
+    if (serverUrl.isEmpty) {
+      _showMessage('Please enter server address', isError: true);
+      return;
+    }
+    
+    // Clean up and format the server URL
+    serverUrl = _formatServerUrl(serverUrl);
+    
+    if (!_isValidServerUrl(serverUrl)) {
+      _showMessage('Invalid server address format', isError: true);
+      return;
     }
     
     setState(() {
@@ -63,27 +68,19 @@ class _SettingsScreenState extends State<SettingsScreen> {
     });
     
     try {
+      // Update controller with formatted URL
+      _serverUrlController.text = serverUrl;
+      
       // Save to settings repository
       await _settings.setServerUrl(serverUrl);
       await _settings.setApiKey(_apiKeyController.text.trim());
       await _settings.setAutoSync(_autoSync);
       await _settings.setCollectLogs(_collectLogs);
       
-      // Also save server URL for native components
-      if (serverUrl.isNotEmpty) {
-        try {
-          await _platformServices.saveServerUrl(serverUrl);
-          print('[SettingsScreen] Server URL saved for native components');
-        } catch (e) {
-          print('[SettingsScreen] Error saving URL to native: $e');
-          // Continue anyway - this is not critical
-        }
-      }
+
       
-      // Show success message
       _showMessage('Settings saved successfully!');
       
-      // Wait a bit before navigating back
       await Future.delayed(const Duration(milliseconds: 500));
       
       if (mounted) {
@@ -101,39 +98,96 @@ class _SettingsScreenState extends State<SettingsScreen> {
     }
   }
 
+  String _formatServerUrl(String url) {
+    String cleanUrl = url.trim();
+    
+    // Remove any trailing slashes
+    cleanUrl = cleanUrl.replaceAll(RegExp(r'/$'), '');
+    
+    // Remove protocol if present (we'll always use raw IP:port)
+    cleanUrl = cleanUrl.replaceAll(RegExp(r'^https?://'), '');
+    
+    // If no port specified, add default port 1514
+    if (!cleanUrl.contains(':')) {
+      cleanUrl = '$cleanUrl:1514';
+    }
+    
+    return cleanUrl;
+  }
+
   bool _isValidServerUrl(String url) {
-    // Remove protocol if present
-    var cleanUrl = url;
-    if (cleanUrl.startsWith('http://')) {
-      cleanUrl = cleanUrl.substring(7);
-    } else if (cleanUrl.startsWith('https://')) {
-      cleanUrl = cleanUrl.substring(8);
-    }
-    
-    // Check if it's IP:port format or just IP
-    final parts = cleanUrl.split(':');
-    if (parts.length > 2) return false;
-    
-    // Validate IP address
-    final ipPattern = RegExp(
-      r'^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$'
-    );
-    
-    if (!ipPattern.hasMatch(parts[0])) {
-      // Could be a hostname - allow it
-      return true;
-    }
-    
-    // Validate IP parts
-    final ipParts = parts[0].split('.');
-    for (var part in ipParts) {
-      final num = int.tryParse(part);
-      if (num == null || num < 0 || num > 255) {
+    try {
+      // Split into host and port
+      final parts = url.split(':');
+      if (parts.length != 2) return false;
+      
+      final host = parts[0];
+      final port = int.tryParse(parts[1]);
+      
+      if (port == null || port < 1 || port > 65535) {
         return false;
       }
+      
+      // Check if it's an IP address
+      final ipPattern = RegExp(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$');
+      if (ipPattern.hasMatch(host)) {
+        // Validate IP parts
+        final ipParts = host.split('.');
+        for (var part in ipParts) {
+          final num = int.tryParse(part);
+          if (num == null || num < 0 || num > 255) {
+            return false;
+          }
+        }
+        return true;
+      }
+      
+      // Could be a hostname - allow it
+      return host.isNotEmpty;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<void> _testConnection() async {
+    if (_isTesting) return;
+    
+    String serverUrl = _serverUrlController.text.trim();
+    final apiKey = _apiKeyController.text.trim();
+    
+    if (serverUrl.isEmpty) {
+      _showMessage('Please enter server address first', isError: true);
+      return;
     }
     
-    return true;
+    // Format the URL
+    serverUrl = _formatServerUrl(serverUrl);
+    _serverUrlController.text = serverUrl;
+    
+    setState(() {
+      _isTesting = true;
+    });
+    
+    try {
+      bool isConnected;
+      if (apiKey.isEmpty) {
+        isConnected = await ConnectionTester.testUdp(serverUrl);
+      } else {
+        isConnected = await ConnectionTester.testRestApi(serverUrl, apiKey);
+      }
+
+      if (isConnected) {
+        _showMessage('✅ Connection successful!');
+      } else {
+        _showMessage('❌ Connection failed', isError: true);
+      }
+    } catch (e) {
+      _showMessage('❌ Connection error: $e', isError: true);
+    } finally {
+      setState(() {
+        _isTesting = false;
+      });
+    }
   }
 
   void _showMessage(String message, {bool isError = false}) {
@@ -148,459 +202,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
     }
   }
 
-  @override
-  Widget build(BuildContext context) {
-    if (_isLoading) {
-      return const Scaffold(
-        body: Center(child: CircularProgressIndicator()),
-      );
-    }
-
-    return Scaffold(
-      appBar: AppBar(
-        title: Row(
-          children: [
-            const Text('Settings'),
-            const SizedBox(width: 8),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-              decoration: BoxDecoration(
-                color: _getPlatformColor(),
-                borderRadius: BorderRadius.circular(12),
-              ),
-              child: Text(
-                _platformName,
-                style: const TextStyle(
-                  fontSize: 12,
-                  fontWeight: FontWeight.bold,
-                  color: Colors.white,
-                ),
-              ),
-            ),
-          ],
-        ),
-        actions: [
-          IconButton(
-            icon: _isSaving 
-                ? const SizedBox(
-                    width: 20,
-                    height: 20,
-                    child: CircularProgressIndicator(
-                      strokeWidth: 2,
-                      valueColor: AlwaysStoppedAnimation(Colors.white),
-                    ),
-                  )
-                : const Icon(Icons.save),
-            onPressed: _isSaving ? null : _saveSettings,
-            tooltip: 'Save Settings',
-          ),
-        ],
-      ),
-      body: _buildSettingsForm(),
-    );
-  }
-
-  Color _getPlatformColor() {
-    switch (_platformName) {
-      case 'Android':
-        return Colors.green;
-      case 'iOS':
-        return Colors.blue;
-      case 'Linux':
-        return Colors.orange;
-      case 'Windows':
-        return Colors.blueAccent;
-      case 'macOS':
-        return Colors.grey;
-      default:
-        return Colors.grey;
-    }
-  }
-
-  Widget _buildSettingsForm() {
-    return SingleChildScrollView(
-      padding: const EdgeInsets.all(16),
-      child: Column(
-        children: [
-          // Platform Info Card
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                children: [
-                  Row(
-                    children: [
-                      _buildPlatformIcon(),
-                      const SizedBox(width: 16),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              _platformName,
-                              style: const TextStyle(
-                                fontSize: 18,
-                                fontWeight: FontWeight.bold,
-                              ),
-                            ),
-                            const SizedBox(height: 4),
-                            Text(
-                              _getPlatformDescription(),
-                              style: const TextStyle(
-                                fontSize: 12,
-                                color: Colors.grey,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 16),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                    children: [
-                      _buildCapabilityChip(
-                        'App Monitoring',
-                        _platformServices.canMonitorAppInstalls(),
-                      ),
-                      _buildCapabilityChip(
-                        'Screen Monitoring',
-                        _platformServices.canMonitorScreenState(),
-                      ),
-                      _buildCapabilityChip(
-                        'Power Monitoring',
-                        _platformServices.canMonitorPower(),
-                      ),
-                    ],
-                  ),
-                ],
-              ),
-            ),
-          ),
-          
-          const SizedBox(height: 20),
-          
-          // Wazuh Server Section
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text(
-                    'Wazuh Server Configuration',
-                    style: TextStyle(
-                      fontSize: 18,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                  const SizedBox(height: 20),
-                  TextField(
-                    controller: _serverUrlController,
-                    decoration: const InputDecoration(
-                      labelText: 'Server Address*',
-                      hintText: '192.168.1.100 or 192.168.1.100:1514',
-                      border: OutlineInputBorder(),
-                      prefixIcon: Icon(Icons.dns),
-                    ),
-                    onChanged: (value) {
-                      // Auto-add default port if missing
-                      if (value.isNotEmpty && 
-                          !value.contains(':') && 
-                          !value.contains('http')) {
-                        WidgetsBinding.instance.addPostFrameCallback((_) {
-                          if (_serverUrlController.text == value) {
-                            _serverUrlController.text = '$value:1514';
-                            _serverUrlController.selection = TextSelection.fromPosition(
-                              TextPosition(offset: _serverUrlController.text.length)
-                            );
-                          }
-                        });
-                      }
-                    },
-                  ),
-                  const SizedBox(height: 8),
-                  Text(
-                    _platformName == 'iOS' 
-                      ? 'Recommended: Use REST API mode for iOS (port 55000)'
-                      : 'Default port: 1514 for UDP, 55000 for REST API',
-                    style: const TextStyle(
-                      fontSize: 12,
-                      color: Colors.grey,
-                    ),
-                  ),
-                  const SizedBox(height: 16),
-                  TextField(
-                    controller: _apiKeyController,
-                    decoration: const InputDecoration(
-                      labelText: 'API Key (Optional)',
-                      hintText: 'Leave empty for UDP mode',
-                      border: OutlineInputBorder(),
-                      prefixIcon: Icon(Icons.key),
-                    ),
-                    obscureText: true,
-                  ),
-                  const SizedBox(height: 10),
-                  Text(
-                    _platformName == 'iOS'
-                      ? 'Note: iOS works best with REST API mode\n'
-                        'UDP may not work reliably on iOS\n'
-                        'Recommended: Use API key for iOS'
-                      : 'Note: Empty API key = UDP mode (port 1514)\n'
-                        'With API key = REST API mode (port 55000)\n'
-                        'Recommended: Use UDP mode for better performance',
-                    style: const TextStyle(
-                      fontSize: 12,
-                      color: Colors.grey,
-                      fontStyle: FontStyle.italic,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-          
-          const SizedBox(height: 20),
-          
-          // Connection Test Section
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text(
-                    'Test Connection',
-                    style: TextStyle(
-                      fontSize: 18,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  const Text(
-                    'Before enabling monitoring, test that logs can reach your Wazuh server.',
-                    style: TextStyle(
-                      fontSize: 14,
-                      color: Colors.grey,
-                    ),
-                  ),
-                  const SizedBox(height: 16),
-                  ElevatedButton.icon(
-                    onPressed: _isSaving ? null : _testConnection,
-                    icon: const Icon(Icons.wifi_find, size: 20),
-                    label: const Text('Test Connection Now'),
-                    style: ElevatedButton.styleFrom(
-                      minimumSize: const Size(double.infinity, 48),
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-                  const Text(
-                    'Check Wazuh server after testing:',
-                    style: TextStyle(fontSize: 12, color: Colors.grey),
-                  ),
-                  const Text(
-                    'sudo tail -f /var/ossec/logs/archives/archives.log',
-                    style: TextStyle(
-                      fontSize: 11,
-                      fontFamily: 'Monospace',
-                      color: Colors.grey,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-          
-          const SizedBox(height: 20),
-          
-          // App Settings Section
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text(
-                    'App Settings',
-                    style: TextStyle(
-                      fontSize: 18,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                  const SizedBox(height: 20),
-                  SwitchListTile(
-                    title: const Text('Auto Sync'),
-                    subtitle: const Text('Automatically sync logs with server'),
-                    value: _autoSync,
-                    onChanged: (value) {
-                      setState(() {
-                        _autoSync = value;
-                      });
-                    },
-                  ),
-                  SwitchListTile(
-                    title: const Text('Collect Logs'),
-                    subtitle: Text(
-                      _platformServices.canMonitorAppInstalls()
-                        ? 'Start collecting logs automatically'
-                        : 'Start limited logging (platform restrictions apply)',
-                    ),
-                    value: _collectLogs,
-                    onChanged: (value) {
-                      setState(() {
-                        _collectLogs = value;
-                      });
-                    },
-                  ),
-                  if (!_platformServices.canMonitorAppInstalls())
-                    Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 16),
-                      child: Text(
-                        '⚠️ Note: $_platformName has limited monitoring capabilities',
-                        style: const TextStyle(
-                          fontSize: 12,
-                          color: Colors.orange,
-                          fontStyle: FontStyle.italic,
-                        ),
-                      ),
-                    ),
-                ],
-              ),
-            ),
-          ),
-          
-          const SizedBox(height: 30),
-          
-          // Save Button
-          SizedBox(
-            width: double.infinity,
-            child: ElevatedButton.icon(
-              onPressed: _isSaving ? null : _saveSettings,
-              icon: _isSaving
-                  ? const SizedBox(
-                      width: 20,
-                      height: 20,
-                      child: CircularProgressIndicator(
-                        strokeWidth: 2,
-                        valueColor: AlwaysStoppedAnimation(Colors.white),
-                      ),
-                    )
-                  : const Icon(Icons.save),
-              label: Text(
-                _isSaving ? 'Saving...' : 'Save Settings',
-                style: const TextStyle(fontSize: 16),
-              ),
-              style: ElevatedButton.styleFrom(
-                padding: const EdgeInsets.symmetric(vertical: 16),
-                backgroundColor: Colors.blue,
-                disabledBackgroundColor: Colors.grey,
-              ),
-            ),
-          ),
-          
-          const SizedBox(height: 20),
-          
-          // Clear Settings Button
-          OutlinedButton.icon(
-            onPressed: _isSaving ? null : _clearSettings,
-            icon: const Icon(Icons.delete_outline, size: 20),
-            label: const Text('Clear All Settings'),
-            style: OutlinedButton.styleFrom(
-              minimumSize: const Size(double.infinity, 48),
-              foregroundColor: Colors.red,
-              side: const BorderSide(color: Colors.red),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildPlatformIcon() {
-    switch (_platformName) {
-      case 'Android':
-        return const Icon(Icons.android, size: 40, color: Colors.green);
-      case 'iOS':
-        return const Icon(Icons.phone_iphone, size: 40, color: Colors.blue);
-      case 'Linux':
-        return const Icon(Icons.computer, size: 40, color: Colors.orange);
-      case 'Windows':
-        return const Icon(Icons.desktop_windows, size: 40, color: Colors.blueAccent);
-      case 'macOS':
-        return const Icon(Icons.desktop_mac, size: 40, color: Colors.grey);
-      default:
-        return const Icon(Icons.device_unknown, size: 40, color: Colors.grey);
-    }
-  }
-
-  Widget _buildCapabilityChip(String label, bool available) {
-    return Column(
-      children: [
-        Icon(
-          available ? Icons.check_circle : Icons.remove_circle,
-          color: available ? Colors.green : Colors.red,
-          size: 24,
-        ),
-        const SizedBox(height: 4),
-        Text(
-          label,
-          style: TextStyle(
-            fontSize: 10,
-            color: available ? Colors.green : Colors.red,
-          ),
-        ),
-      ],
-    );
-  }
-
-  String _getPlatformDescription() {
-    switch (_platformName) {
-      case 'Android':
-        return 'Full monitoring capabilities including app install tracking';
-      case 'iOS':
-        return 'Limited monitoring (Apple restrictions apply)';
-      case 'Linux':
-        return 'Basic monitoring, no app install tracking';
-      case 'Windows':
-        return 'Basic monitoring, no app install tracking';
-      case 'macOS':
-        return 'Basic monitoring, no app install tracking';
-      default:
-        return 'Unknown platform capabilities';
-    }
-  }
-
-  Future<void> _testConnection() async {
-    final serverUrl = _serverUrlController.text.trim();
-    final apiKey = _apiKeyController.text.trim();
-    
-    if (serverUrl.isEmpty) {
-      _showMessage('Please enter server address first', isError: true);
-      return;
-    }
-    
-    // Save temporarily for testing
-    await _settings.setServerUrl(serverUrl);
-    if (apiKey.isNotEmpty) {
-      await _settings.setApiKey(apiKey);
-    }
-    
-    // Navigate back to home to test
-    if (mounted) {
-      Navigator.pop(context);
-      // Trigger test in home screen
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Go to Home screen and click "Test Connection"'),
-            duration: Duration(seconds: 5),
-          ),
-        );
-      });
-    }
-  }
-  
   Future<void> _clearSettings() async {
     final confirmed = await showDialog<bool>(
       context: context,
@@ -627,12 +228,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
       
       try {
         await _settings.clearAll();
-        
-        // Clear controllers
         _serverUrlController.clear();
         _apiKeyController.clear();
         
-        // Reset to defaults
         setState(() {
           _autoSync = true;
           _collectLogs = false;
@@ -648,5 +246,276 @@ class _SettingsScreenState extends State<SettingsScreen> {
         });
       }
     }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_isLoading) {
+      return const Scaffold(
+        body: Center(child: CircularProgressIndicator()),
+      );
+    }
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Settings'),
+        actions: [
+          if (_isSaving)
+            const Padding(
+              padding: EdgeInsets.only(right: 16),
+              child: Center(
+                child: SizedBox(
+                  width: 20,
+                  height: 20,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    valueColor: AlwaysStoppedAnimation(Colors.white),
+                  ),
+                ),
+              ),
+            ),
+        ],
+      ),
+      body: _buildSettingsForm(),
+    );
+  }
+
+  Widget _buildSettingsForm() {
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          // Server Configuration
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'Server Configuration',
+                    style: TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  TextField(
+                    controller: _serverUrlController,
+                    decoration: InputDecoration(
+                      labelText: 'Server Address',
+                      hintText: '192.168.1.100',
+                      border: const OutlineInputBorder(),
+                      prefixIcon: const Icon(Icons.dns),
+                      suffixIcon: IconButton(
+                        icon: const Icon(Icons.info_outline),
+                        onPressed: () {
+                          showDialog(
+                            context: context,
+                            builder: (context) => AlertDialog(
+                              title: const Text('Server Address Format'),
+                              content: const Text(
+                                'Enter IP address only (e.g., 192.168.1.100)\n'
+                                'Port 1514 will be added automatically for UDP mode.\n'
+                                'For REST API mode, use port 55000.',
+                              ),
+                              actions: [
+                                TextButton(
+                                  onPressed: () => Navigator.pop(context),
+                                  child: const Text('OK'),
+                                ),
+                              ],
+                            ),
+                          );
+                        },
+                        tooltip: 'Format: IP address only',
+                      ),
+                    ),
+                    inputFormatters: [
+                      FilteringTextInputFormatter.allow(RegExp(r'[0-9\.:]')),
+                    ],
+                    keyboardType: TextInputType.number,
+                    onChanged: (value) {
+                      // Auto-suggest port 1514
+                      if (value.isNotEmpty && 
+                          !value.contains(':') && 
+                          RegExp(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$').hasMatch(value)) {
+                        WidgetsBinding.instance.addPostFrameCallback((_) {
+                          if (_serverUrlController.text == value) {
+                            setState(() {
+                              _serverUrlController.text = '$value:1514';
+                              _serverUrlController.selection = TextSelection.fromPosition(
+                                TextPosition(offset: _serverUrlController.text.length)
+                              );
+                            });
+                          }
+                        });
+                      }
+                    },
+                  ),
+                  const SizedBox(height: 8),
+                  const Text(
+                    'Port 1514 will be added automatically for UDP mode',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: Colors.grey,
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  TextField(
+                    controller: _apiKeyController,
+                    decoration: const InputDecoration(
+                      labelText: 'API Key (Optional)',
+                      hintText: 'Leave empty for UDP mode',
+                      border: OutlineInputBorder(),
+                      prefixIcon: Icon(Icons.key),
+                    ),
+                    obscureText: true,
+                  ),
+                  const SizedBox(height: 8),
+                  const Text(
+                    'Empty = UDP mode (port 1514)\nWith API key = REST API mode (port 55000)',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: Colors.grey,
+                      fontStyle: FontStyle.italic,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          
+          const SizedBox(height: 16),
+          
+          // Test Connection Button
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  const Text(
+                    'Test Connection',
+                    style: TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  const Text(
+                    'Test that logs can reach your server before enabling monitoring.',
+                    style: TextStyle(
+                      fontSize: 14,
+                      color: Colors.grey,
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  ElevatedButton.icon(
+                    onPressed: _isTesting || _isSaving ? null : _testConnection,
+                    icon: _isTesting
+                        ? const SizedBox(
+                            width: 20,
+                            height: 20,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              valueColor: AlwaysStoppedAnimation(Colors.white),
+                            ),
+                          )
+                        : const Icon(Icons.wifi_find, size: 20),
+                    label: Text(_isTesting ? 'Testing...' : 'Test Connection'),
+                    style: ElevatedButton.styleFrom(
+                      minimumSize: const Size(double.infinity, 48),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          
+          const SizedBox(height: 16),
+          
+          // App Settings
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'Monitoring Settings',
+                    style: TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  SwitchListTile(
+                    title: const Text('Auto Sync'),
+                    subtitle: const Text('Automatically sync logs with server'),
+                    value: _autoSync,
+                    onChanged: (value) {
+                      setState(() {
+                        _autoSync = value;
+                      });
+                    },
+                  ),
+                  SwitchListTile(
+                    title: const Text('Collect Logs'),
+                    subtitle: const Text('Start collecting logs automatically'),
+                    value: _collectLogs,
+                    onChanged: (value) {
+                      setState(() {
+                        _collectLogs = value;
+                      });
+                    },
+                  ),
+                ],
+              ),
+            ),
+          ),
+          
+          const SizedBox(height: 24),
+          
+          // Save Button
+          ElevatedButton(
+            onPressed: _isSaving ? null : _saveSettings,
+            style: ElevatedButton.styleFrom(
+              padding: const EdgeInsets.symmetric(vertical: 16),
+              backgroundColor: Colors.blue,
+            ),
+            child: _isSaving
+                ? const SizedBox(
+                    width: 20,
+                    height: 20,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                      valueColor: AlwaysStoppedAnimation(Colors.white),
+                    ),
+                  )
+                : const Text(
+                    'Save Settings',
+                    style: TextStyle(fontSize: 16),
+                  ),
+          ),
+          
+          const SizedBox(height: 12),
+          
+          // Clear Settings Button
+          OutlinedButton(
+            onPressed: _isSaving ? null : _clearSettings,
+            style: OutlinedButton.styleFrom(
+              padding: const EdgeInsets.symmetric(vertical: 16),
+              side: const BorderSide(color: Colors.red),
+            ),
+            child: const Text(
+              'Clear All Settings',
+              style: TextStyle(color: Colors.red),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 }
