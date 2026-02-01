@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:io';
-import 'package:flutter/services.dart';
 
 // Device monitoring packages
 import 'package:device_apps/device_apps.dart';
@@ -11,20 +10,21 @@ import 'package:battery_plus/battery_plus.dart';
 // Local imports
 import 'package:mhf_log_shield/utils/log_sender.dart';
 import 'package:mhf_log_shield/data/repositories/settings_repository.dart';
-import 'package:shared_preferences/shared_preferences.dart';
+import 'package:mhf_log_shield/services/background_logger.dart';
 
 class AppMonitor {
   final SettingsRepository _settings;
   final LogSender _logSender;
+  
+  // Android-specific: App tracking
   List<Application> _previousApps = [];
+  final Map<String, String> _appVersions = {};
+  
+  // Cross-platform: Device tracking
   Timer? _monitorTimer;
   final Battery _battery = Battery();
   final Connectivity _connectivity = Connectivity();
   final DeviceInfoPlugin _deviceInfo = DeviceInfoPlugin();
-  
-  // NEW: Track app versions for update detection
-  final Map<String, String> _appVersions = {};
-  final Map<String, String> _appInstallSources = {};
   
   // Stream subscriptions for cleanup
   StreamSubscription<BatteryState>? _batterySubscription;
@@ -32,49 +32,103 @@ class AppMonitor {
 
   AppMonitor(this._settings, this._logSender);
 
-  /// Start monitoring device and apps
+  /// Start monitoring device and apps (cross-platform)
   Future<void> startMonitoring() async {
     await _settings.initialize();
     
-    // Get initial app list with versions
-    _previousApps = await DeviceApps.getInstalledApplications(
-      includeAppIcons: false,
-      includeSystemApps: true,
-      onlyAppsWithLaunchIntent: false,
-    );
+    print('[AppMonitor] Starting monitoring');
     
-    // NEW: Cache initial app versions and install sources
-    await _cacheAppVersions();
-    await _cacheInstallSources();
+    // Check if on Android for app monitoring
+    if (Platform.isAndroid) {
+      await _startAndroidAppMonitoring();
+    } else {
+      print('[AppMonitor] App install monitoring only available on Android');
+    }
     
-    print('[AppMonitor] Monitoring ${_previousApps.length} apps');
-    
-    // Send device info once
-    await _logDeviceInfo();
-    
-    // Start periodic checks
-    _monitorTimer = Timer.periodic(
-      const Duration(seconds: 10),
-      (timer) => _checkForChanges(),
-    );
-    
-    // Start real-time device monitoring
-    _startDeviceMonitoring();
+    // Start cross-platform device monitoring
+    await _startDeviceMonitoring();
     
     print('[AppMonitor] Monitoring started successfully');
   }
+
+  /// Android-specific app monitoring
+  Future<void> _startAndroidAppMonitoring() async {
+    try {
+      // Get initial app list with versions
+      _previousApps = await DeviceApps.getInstalledApplications(
+        includeAppIcons: false,
+        includeSystemApps: true,
+        onlyAppsWithLaunchIntent: false,
+      );
+      
+      // Cache initial app versions
+      await _cacheAppVersions();
+      
+      // Log initial app count
+      await _logInitialAppCount();
+      
+      print('[AppMonitor] Monitoring ${_previousApps.length} apps');
+      
+      // Start periodic app checks
+      _monitorTimer = Timer.periodic(
+        const Duration(seconds: 30),
+        (timer) => _checkForAppChanges(),
+      );
+      
+    } catch (e) {
+      print('[AppMonitor] Error starting Android app monitoring: $e');
+    }
+  }
+
+  /// Log initial app count
+  Future<void> _logInitialAppCount() async {
+    final serverUrl = _settings.getServerUrl();
+    if (serverUrl.isEmpty) return;
+    
+    try {
+      final totalApps = _previousApps.length;
+      final systemApps = _previousApps.where((app) => app.systemApp).length;
+      final userApps = totalApps - systemApps;
+      
+      final message = '📱 Initial App Inventory\n'
+                      '• Total Apps: $totalApps\n'
+                      '• User Apps: $userApps\n'
+                      '• System Apps: $systemApps';
+      
+      await _logSender.sendCustomLog(
+        serverUrl, 
+        '', 
+        message, 
+        'INFO'
+      );
+      
+      print('[AppMonitor] Logged initial app count: $totalApps total, $userApps user, $systemApps system');
+    } catch (e) {
+      print('[AppMonitor] Error logging initial app count: $e');
+    }
+  }
   
   /// Stop all monitoring
-  void stopMonitoring() {
+  Future<void> stopMonitoring() async {
+    print('[AppMonitor] Stopping monitoring');
+    
+    // Stop timers
     _monitorTimer?.cancel();
     _monitorTimer = null;
+    
+    // Cancel subscriptions
     _batterySubscription?.cancel();
     _connectivitySubscription?.cancel();
+    
     print('[AppMonitor] Monitoring stopped');
   }
   
-  /// Check for app installation/uninstallation/update changes
-  Future<void> _checkForChanges() async {
+  /// Check for app installation/uninstallation/update changes (Android only)
+  Future<void> _checkForAppChanges() async {
+    if (!Platform.isAndroid) {
+      return;
+    }
+    
     try {
       final serverUrl = _settings.getServerUrl();
       if (serverUrl.isEmpty) {
@@ -102,7 +156,7 @@ class AppMonitor {
         }
       }
       
-      // NEW: Check for app updates
+      // Check for app updates
       for (final app in currentApps) {
         if (_previousApps.any((a) => a.packageName == app.packageName)) {
           await _checkForAppUpdate(app);
@@ -114,12 +168,14 @@ class AppMonitor {
       await _cacheAppVersions();
       
     } catch (e) {
-      print('[AppMonitor] Error checking changes: $e');
+      print('[AppMonitor] Error checking app changes: $e');
     }
   }
   
-  /// NEW: Cache app versions for update detection
+  /// Cache app versions for update detection (Android only)
   Future<void> _cacheAppVersions() async {
+    if (!Platform.isAndroid) return;
+    
     _appVersions.clear();
     for (final app in _previousApps) {
       try {
@@ -133,63 +189,10 @@ class AppMonitor {
     }
   }
   
-  /// NEW: Get install source (requires API 30+/Android 11+)
-  Future<String> _getInstallSource(String packageName) async {
-    try {
-      if (Platform.isAndroid) {
-        // Try to get install source using platform channel
-        const platform = MethodChannel('app_monitor_channel');
-        final result = await platform.invokeMethod<String>(
-          'getInstallSource',
-          {'packageName': packageName},
-        );
-        
-        if (result != null) {
-          // Map installer package to readable name
-          return _mapInstallSource(result);
-        }
-      }
-    } catch (e) {
-      print('[AppMonitor] Error getting install source: $e');
-    }
-    
-    return 'Unknown';
-  }
-  
-  /// NEW: Map installer package to readable name
-  String _mapInstallSource(String installerPackage) {
-    final Map<String, String> sourceMap = {
-      'com.android.vending': 'Google Play Store',
-      'com.amazon.venezia': 'Amazon Appstore',
-      'com.samsung.android.app.galaxyappstore': 'Samsung Galaxy Store',
-      'com.huawei.appmarket': 'Huawei AppGallery',
-      'com.xiaomi.market': 'Xiaomi App Store',
-      'com.oppo.market': 'Oppo App Market',
-      'com.vivo.appstore': 'Vivo App Store',
-      'com.tencent.android.qqdownloader': 'Tencent App Center',
-      'com.sec.android.app.samsungapps': 'Samsung Apps (old)',
-      'com.lenovo.leos.appstore': 'Lenovo App Store',
-    };
-    
-    return sourceMap[installerPackage] ?? 
-           (installerPackage.contains('packageinstaller') ? 'Manual APK' : installerPackage);
-  }
-  
-  /// NEW: Cache install sources
-  Future<void> _cacheInstallSources() async {
-    _appInstallSources.clear();
-    for (final app in _previousApps) {
-      if (!app.systemApp) { // Only check user apps
-        final source = await _getInstallSource(app.packageName);
-        _appInstallSources[app.packageName] = source;
-      } else {
-        _appInstallSources[app.packageName] = 'System';
-      }
-    }
-  }
-  
-  /// NEW: Check for app updates
+  /// Check for app updates (Android only)
   Future<void> _checkForAppUpdate(Application app) async {
+    if (!Platform.isAndroid) return;
+    
     try {
       final currentApp = await DeviceApps.getApp(app.packageName);
       if (currentApp == null || currentApp.versionName == null) return;
@@ -207,7 +210,7 @@ class AppMonitor {
     }
   }
   
-  /// Log when an app is installed
+  /// Log when an app is installed (Android only)
   Future<void> _logAppInstallation(Application app) async {
     final serverUrl = _settings.getServerUrl();
     if (serverUrl.isEmpty) return;
@@ -218,45 +221,38 @@ class AppMonitor {
       final version = appWithData?.versionName ?? 'Unknown';
       final versionCode = appWithData?.versionCode?.toString() ?? 'Unknown';
       
-      // Get install source
-      final installSource = await _getInstallSource(app.packageName);
-      
-      // Get install date (approximate)
-      final installDate = _getApproximateInstallDate();
-      
       final appType = app.systemApp ? 'System App' : 'User App';
       final message = '📱 APP INSTALLED\n'
                       '• Name: ${app.appName}\n'
                       '• Package: ${app.packageName}\n'
                       '• Type: $appType\n'
-                      '• Version: $version ($versionCode)\n'
-                      '• Source: $installSource\n'
-                      '• Installed: $installDate';
+                      '• Version: $version ($versionCode)';
       
-      await _logSender.sendCustomLog(
+      // Send immediately to server
+      final success = await _logSender.sendCustomLog(
         serverUrl, 
         '', 
         message, 
         'INFO'
       );
       
-      print('[AppMonitor] App installed: ${app.appName} v$version from $installSource');
+      if (success) {
+        print('[AppMonitor] ✅ App installed log sent: ${app.appName} v$version');
+      } else {
+        print('[AppMonitor] ❌ Failed to send app installed log');
+        await BackgroundLogger.storeAppEventOffline('install', app.appName, app.packageName);
+      }
       
-      // Cache the install source
-      _appInstallSources[app.packageName] = installSource;
+      // Cache the version
       _appVersions[app.packageName] = version;
-      
-      // Store offline for backup
-      await _storeAppEvent('install', app.appName, app.packageName, 
-                          version: version, source: installSource);
       
     } catch (e) {
       print('[AppMonitor] Failed to send installation log: $e');
-      await _storeAppEvent('install', app.appName, app.packageName);
+      await BackgroundLogger.storeAppEventOffline('install', app.appName, app.packageName);
     }
   }
   
-  /// NEW: Log when an app is updated
+  /// Log when an app is updated (Android only)
   Future<void> _logAppUpdate(Application app, String oldVersion, String newVersion) async {
     final serverUrl = _settings.getServerUrl();
     if (serverUrl.isEmpty) return;
@@ -264,7 +260,6 @@ class AppMonitor {
     try {
       final appWithData = await DeviceApps.getApp(app.packageName);
       final versionCode = appWithData?.versionCode?.toString() ?? 'Unknown';
-      final installSource = _appInstallSources[app.packageName] ?? 'Unknown';
       
       final appType = app.systemApp ? 'System App' : 'User App';
       final message = '🔄 APP UPDATED\n'
@@ -272,131 +267,93 @@ class AppMonitor {
                       '• Package: ${app.packageName}\n'
                       '• Type: $appType\n'
                       '• Old Version: $oldVersion\n'
-                      '• New Version: $newVersion ($versionCode)\n'
-                      '• Source: $installSource\n'
-                      '• Updated: ${DateTime.now().toString()}';
+                      '• New Version: $newVersion ($versionCode)';
       
-      await _logSender.sendCustomLog(
+      // Send immediately to server
+      final success = await _logSender.sendCustomLog(
         serverUrl, 
         '', 
         message, 
         'INFO'
       );
       
-      print('[AppMonitor] App updated: ${app.appName} $oldVersion → $newVersion');
-      
-      // Store offline
-      await _storeAppEvent('update', app.appName, app.packageName, 
-                          oldVersion: oldVersion, newVersion: newVersion);
+      if (success) {
+        print('[AppMonitor] ✅ App update log sent: ${app.appName} $oldVersion → $newVersion');
+      } else {
+        print('[AppMonitor] ❌ Failed to send app update log');
+        await BackgroundLogger.storeAppEventOffline('update', app.appName, app.packageName);
+      }
       
     } catch (e) {
       print('[AppMonitor] Failed to send update log: $e');
-      await _storeAppEvent('update', app.appName, app.packageName);
+      await BackgroundLogger.storeAppEventOffline('update', app.appName, app.packageName);
     }
   }
   
-  /// Log when an app is uninstalled
+  /// Log when an app is uninstalled (Android only)
   Future<void> _logAppUninstallation(Application app) async {
     final serverUrl = _settings.getServerUrl();
     if (serverUrl.isEmpty) return;
     
     try {
       final oldVersion = _appVersions[app.packageName] ?? 'Unknown';
-      final installSource = _appInstallSources[app.packageName] ?? 'Unknown';
       
       final appType = app.systemApp ? 'System App' : 'User App';
       final message = '🗑️ APP UNINSTALLED\n'
                       '• Name: ${app.appName}\n'
                       '• Package: ${app.packageName}\n'
                       '• Type: $appType\n'
-                      '• Last Version: $oldVersion\n'
-                      '• Source: $installSource\n'
-                      '• Uninstalled: ${DateTime.now().toString()}';
+                      '• Last Version: $oldVersion';
       
-      await _logSender.sendCustomLog(
+      // Send immediately to server
+      final success = await _logSender.sendCustomLog(
         serverUrl, 
         '', 
         message, 
         'INFO'
       );
       
-      print('[AppMonitor] App uninstalled: ${app.appName}');
+      if (success) {
+        print('[AppMonitor] ✅ App uninstalled log sent: ${app.appName}');
+      } else {
+        print('[AppMonitor] ❌ Failed to send app uninstalled log');
+        await BackgroundLogger.storeAppEventOffline('uninstall', app.appName, app.packageName);
+      }
       
       // Remove from cache
       _appVersions.remove(app.packageName);
-      _appInstallSources.remove(app.packageName);
-      
-      // Store offline
-      await _storeAppEvent('uninstall', app.appName, app.packageName, 
-                          version: oldVersion, source: installSource);
       
     } catch (e) {
       print('[AppMonitor] Failed to send uninstallation log: $e');
-      await _storeAppEvent('uninstall', app.appName, app.packageName);
+      await BackgroundLogger.storeAppEventOffline('uninstall', app.appName, app.packageName);
     }
   }
   
-  /// Enhanced: Store app event with more details
-  Future<void> _storeAppEvent(String event, String appName, String packageName, 
-                              {String? version, String? oldVersion, String? newVersion, String? source}) async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      final events = prefs.getStringList('app_events') ?? [];
-      final timestamp = DateTime.now().toIso8601String();
-      
-      final eventData = {
-        'timestamp': timestamp,
-        'event': event,
-        'app_name': appName,
-        'package': packageName,
-        'version': version ?? '',
-        'old_version': oldVersion ?? '',
-        'new_version': newVersion ?? '',
-        'source': source ?? '',
-      };
-      
-      events.add(eventData.entries
-          .where((entry) => entry.value.isNotEmpty)
-          .map((entry) => '${entry.key}:${entry.value}')
-          .join('|'));
-      
-      // Keep last 200 events
-      final recentEvents = events.length > 200 
-          ? events.sublist(events.length - 200) 
-          : events;
-      
-      await prefs.setStringList('app_events', recentEvents);
-    } catch (e) {
-      print('[AppMonitor] Error storing app event: $e');
-    }
-  }
-  
-  /// NEW: Get approximate install date (works for Android API 30+)
-  String _getApproximateInstallDate() {
-    return DateTime.now().toString(); // For older APIs, use current time
-  }
-  
-  /// Start monitoring device states (battery, network)
+  /// Start cross-platform device monitoring
   Future<void> _startDeviceMonitoring() async {
-    try {
-      // Monitor battery changes
-      _batterySubscription = _battery.onBatteryStateChanged.listen((BatteryState state) async {
-        await _logBatteryChange(state);
-      });
-      
-      // Monitor network changes
-      _connectivitySubscription = _connectivity.onConnectivityChanged.listen((List<ConnectivityResult> results) async {
-        if (results.isNotEmpty) {
-          await _logNetworkChange(results.first);
-        }
-      });
-      
-    } catch (e) {
-      print('[AppMonitor] Error starting device monitoring: $e');
-    }
+    // Send device info once
+    await _logDeviceInfo();
+    
+    // Start periodic device status checks
+    Timer.periodic(
+      const Duration(minutes: 5),
+      (timer) => _logPeriodicStatus(),
+    );
+    
+    // Monitor battery changes (cross-platform)
+    _batterySubscription = _battery.onBatteryStateChanged.listen((BatteryState state) async {
+      await _logBatteryChange(state);
+    });
+    
+    // Monitor network changes (cross-platform)
+    _connectivitySubscription = _connectivity.onConnectivityChanged.listen((List<ConnectivityResult> results) async {
+      if (results.isNotEmpty) {
+        await _logNetworkChange(results.first);
+      }
+    });
   }
   
-  /// Log battery state change
+  /// Log battery state change (cross-platform)
   Future<void> _logBatteryChange(BatteryState state) async {
     final serverUrl = _settings.getServerUrl();
     if (serverUrl.isEmpty) return;
@@ -404,44 +361,64 @@ class AppMonitor {
     try {
       final level = await _battery.batteryLevel;
       final stateStr = _getBatteryStateString(state);
-      final message = '🔋 Battery: $level% - $stateStr';
       
-      await _logSender.sendCustomLog(
-        serverUrl, 
-        '', 
-        message, 
-        'INFO'
-      );
-      
-      print('[AppMonitor] $message');
+      // Only log significant changes (every 10% or state change)
+      if (stateStr != _lastBatteryState || (level % 10 == 0 && level != _lastBatteryLevel)) {
+        final message = '🔋 Battery: $level% - $stateStr';
+        
+        final success = await _logSender.sendCustomLog(
+          serverUrl, 
+          '', 
+          message, 
+          'INFO'
+        );
+        
+        if (success) {
+          print('[AppMonitor] ✅ Battery log sent: $message');
+          _lastBatteryState = stateStr;
+          _lastBatteryLevel = level;
+        }
+      }
     } catch (e) {
       print('[AppMonitor] Error getting battery info: $e');
     }
   }
   
-  /// Log network connectivity change
+  String _lastBatteryState = '';
+  int _lastBatteryLevel = 0;
+  
+  /// Log network connectivity change (cross-platform)
   Future<void> _logNetworkChange(ConnectivityResult result) async {
     final serverUrl = _settings.getServerUrl();
     if (serverUrl.isEmpty) return;
     
     final networkStr = _getNetworkTypeString(result);
-    final message = '🌐 Network changed: $networkStr';
     
-    try {
-      await _logSender.sendCustomLog(
-        serverUrl, 
-        '', 
-        message, 
-        'INFO'
-      );
+    // Only log if network type changed
+    if (networkStr != _lastNetworkState) {
+      final message = '🌐 Network changed: $networkStr';
       
-      print('[AppMonitor] $message');
-    } catch (e) {
-      print('[AppMonitor] Error logging network change: $e');
+      try {
+        final success = await _logSender.sendCustomLog(
+          serverUrl, 
+          '', 
+          message, 
+          'INFO'
+        );
+        
+        if (success) {
+          print('[AppMonitor] ✅ Network log sent: $message');
+          _lastNetworkState = networkStr;
+        }
+      } catch (e) {
+        print('[AppMonitor] Error logging network change: $e');
+      }
     }
   }
   
-  /// Log periodic device status
+  String _lastNetworkState = '';
+  
+  /// Log periodic device status (cross-platform)
   Future<void> _logPeriodicStatus() async {
     final serverUrl = _settings.getServerUrl();
     if (serverUrl.isEmpty) return;
@@ -452,50 +429,66 @@ class AppMonitor {
       final networkStr = networkResults.isNotEmpty 
           ? _getNetworkTypeString(networkResults.first)
           : 'No Connection';
-      final appCount = _previousApps.length;
+      
+      final appCount = Platform.isAndroid ? _previousApps.length : 0;
       
       final message = '📊 Status Update | '
+                      'Platform: ${Platform.operatingSystem} | '
                       'Apps: $appCount | '
                       'Battery: $batteryLevel% | '
                       'Network: $networkStr';
       
-      await _logSender.sendCustomLog(
+      final success = await _logSender.sendCustomLog(
         serverUrl, 
         '', 
         message, 
         'INFO'
       );
       
+      if (success) {
+        print('[AppMonitor] ✅ Periodic status log sent');
+      }
+      
     } catch (e) {
       print('[AppMonitor] Error logging periodic status: $e');
     }
   }
   
-  /// Log device information (once)
+  /// Log device information (cross-platform)
   Future<void> _logDeviceInfo() async {
     final serverUrl = _settings.getServerUrl();
     if (serverUrl.isEmpty) return;
     
     try {
+      final deviceInfo = await getDeviceInformation();
+      final platformName = Platform.operatingSystem;
+      
+      String message = '📱 $platformName Device Info\n';
+      
       if (Platform.isAndroid) {
-        final androidInfo = await _deviceInfo.androidInfo;
-        
-        final message = '📱 Device Info | '
-                        'Model: ${androidInfo.model} | '
-                        'Android: ${androidInfo.version.release} | '
-                        'SDK: ${androidInfo.version.sdkInt} | '
-                        'Brand: ${androidInfo.brand} | '
-                        'Device: ${androidInfo.device}';
-        
-        await _logSender.sendCustomLog(
-          serverUrl, 
-          '', 
-          message, 
-          'INFO'
-        );
-        
-        print('[AppMonitor] $message');
+        message += '• Model: ${deviceInfo['model']}\n'
+                   '• Android: ${deviceInfo['android_version']}\n'
+                   '• SDK: ${deviceInfo['sdk_version']}\n'
+                   '• Brand: ${deviceInfo['brand']}';
+      } else if (Platform.isIOS) {
+        message += '• Device: ${deviceInfo['name']}\n'
+                   '• Model: ${deviceInfo['model']}\n'
+                   '• iOS: ${deviceInfo['system_version']}';
+      } else {
+        message += '• Platform: $platformName';
       }
+      
+      final success = await _logSender.sendCustomLog(
+        serverUrl, 
+        '', 
+        message, 
+        'INFO'
+      );
+      
+      if (success) {
+        print('[AppMonitor] ✅ Device info log sent');
+      }
+      
     } catch (e) {
       print('[AppMonitor] Error getting device info: $e');
     }
@@ -535,8 +528,12 @@ class AppMonitor {
     }
   }
   
-  /// Get current installed apps count
+  /// Get current installed apps count (Android only)
   Future<int> getInstalledAppsCount() async {
+    if (!Platform.isAndroid) {
+      return 0;
+    }
+    
     try {
       final apps = await DeviceApps.getInstalledApplications();
       return apps.length;
@@ -546,8 +543,15 @@ class AppMonitor {
     }
   }
   
-  /// Get all installed apps with details
+  /// Get all installed apps with details (Android only)
   Future<List<Map<String, dynamic>>> getAllInstalledApps() async {
+    if (!Platform.isAndroid) {
+      return [{
+        'note': 'App list only available on Android',
+        'platform': Platform.operatingSystem,
+      }];
+    }
+    
     try {
       final apps = await DeviceApps.getInstalledApplications(
         includeAppIcons: false,
@@ -566,39 +570,37 @@ class AppMonitor {
       return [];
     }
   }
-  
-  /// Get device information
+
+  /// Get device information (cross-platform)
   Future<Map<String, dynamic>> getDeviceInformation() async {
     try {
       if (Platform.isAndroid) {
         final androidInfo = await _deviceInfo.androidInfo;
         return {
+          'platform': 'Android',
           'model': androidInfo.model,
           'brand': androidInfo.brand,
-          'device': androidInfo.device,
           'android_version': androidInfo.version.release,
           'sdk_version': androidInfo.version.sdkInt,
-          'board': androidInfo.board,
-          'bootloader': androidInfo.bootloader,
-          'fingerprint': androidInfo.fingerprint,
-          'hardware': androidInfo.hardware,
-          'host': androidInfo.host,
-          'id': androidInfo.id,
-          'manufacturer': androidInfo.manufacturer,
-          'product': androidInfo.product,
-          'tags': androidInfo.tags,
-          'type': androidInfo.type,
-          'is_physical_device': androidInfo.isPhysicalDevice,
         };
+      } else if (Platform.isIOS) {
+        final iosInfo = await _deviceInfo.iosInfo;
+        return {
+          'platform': 'iOS',
+          'name': iosInfo.name,
+          'model': iosInfo.model,
+          'system_version': iosInfo.systemVersion,
+        };
+      } else {
+        return {'platform': Platform.operatingSystem};
       }
-      return {};
     } catch (e) {
       print('[AppMonitor] Error getting device information: $e');
-      return {};
+      return {'platform': Platform.operatingSystem, 'error': e.toString()};
     }
   }
   
-  /// Get current battery status
+  /// Get current battery status (cross-platform)
   Future<Map<String, dynamic>> getBatteryStatus() async {
     try {
       final level = await _battery.batteryLevel;
@@ -615,7 +617,7 @@ class AppMonitor {
     }
   }
   
-  /// Get current network status
+  /// Get current network status (cross-platform)
   Future<Map<String, dynamic>> getNetworkStatus() async {
     try {
       final results = await _connectivity.checkConnectivity();
@@ -635,19 +637,4 @@ class AppMonitor {
       };
     }
   }
-
-
-
-  // In AppMonitor class (where you have the MethodChannel)
-static Future<void> saveServerUrlForNative(String serverUrl) async {
-  try {
-    const platform = MethodChannel('app_monitor_channel'); // Use your existing channel
-    await platform.invokeMethod('saveServerUrl', {'url': serverUrl});
-    print('[AppMonitor] Server URL saved for native components: $serverUrl');
-  } catch (e) {
-    print('[AppMonitor] Error saving server URL: $e');
-  }
-}
-
-
 }

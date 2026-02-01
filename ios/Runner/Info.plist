@@ -45,5 +45,49 @@
 	<true/>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
+	
+	<!-- Background modes for iOS -->
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>fetch</string>
+		<string>processing</string>
+	</array>
+
+	<!-- Network security for local network access -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+		<key>NSExceptionDomains</key>
+		<dict>
+			<key>localhost</key>
+			<dict>
+				<key>NSExceptionAllowsInsecureHTTPLoads</key>
+				<true/>
+			</dict>
+		</dict>
+	</dict>
+
+	<!-- Privacy descriptions (required for iOS 14+) -->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>MHF Log Shield needs network access to send logs to your Wazuh server</string>
+
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_logshield._tcp</string>
+		<string>_logshield._udp</string>
+	</array>
+
+	<!-- Battery usage description (for battery monitoring) -->
+	<key>NSBatteryUsageDescription</key>
+	<string>Monitoring battery level helps optimize log collection and transmission</string>
+
+	<!-- Background task identifiers (iOS 13+) -->
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>com.mhf.logshield.refresh</string>
+		<string>com.mhf.logshield.backgroundsync</string>
+		<string>com.mhf.logshield.logflush</string>
+	</array>
 </dict>
 </plist>

@@ -1,5 +1,3 @@
-val kotlin_version: String by extra("1.9.22")
-
 allprojects {
     repositories {
         google()

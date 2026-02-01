@@ -1,12 +1,15 @@
+import 'dart:async';
 import 'dart:io';
-
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
+import 'package:battery_plus/battery_plus.dart';
+import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:mhf_log_shield/data/repositories/settings_repository.dart';
+import 'package:mhf_log_shield/services/advanced_monitor.dart';
 import 'package:mhf_log_shield/services/background_logger.dart';
 import 'package:mhf_log_shield/ui/screens/settings_screen.dart';
 import 'package:mhf_log_shield/utils/connection_tester.dart';
 import 'package:mhf_log_shield/utils/log_sender.dart';
+import 'package:mhf_log_shield/services/app_monitor.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -15,29 +18,147 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen> {
+class _HomeScreenState extends State<HomeScreen>
+    with WidgetsBindingObserver {
   final SettingsRepository _settings = SettingsRepository();
   final LogSender _logSender = LogSender();
+  final Battery _battery = Battery();
+  final Connectivity _connectivity = Connectivity();
+  late final String _platformName;
+  late final bool _isAndroid;
+
   bool _isConfigured = false;
   bool _isCollecting = false;
   bool _isAdvancedMonitoring = false;
   String _connectionMode = 'UDP';
   String _serverAddress = '';
   bool _isTesting = false;
+  bool _showNativeWarning = false;
   Map<String, dynamic> _monitoringStats = {};
-  bool _hasUsagePermission = false;
-
-  // Method channels
-  static const MethodChannel _channel = MethodChannel('app_monitor_channel');
-  static const MethodChannel _advancedChannel = MethodChannel(
-    'advanced_monitor_channel',
-  );
+  AppMonitor? _appMonitor;
+  int _pendingLogsCount = 0;
+  int _appEventsCount = 0;
+  Timer? _statsTimer;
+  Timer? _monitoringTimer;
+  StreamSubscription<List<ConnectivityResult>>? _networkSubscription;
+  Timer? _appStateTimer;
+  AppLifecycleState? _currentAppState;
+  DateTime? _lastAppStateChange;
 
   @override
   void initState() {
     super.initState();
+    _platformName = Platform.operatingSystem;
+    _isAndroid = Platform.isAndroid;
+    
+    // Add observer for app lifecycle events
+    WidgetsBinding.instance.addObserver(this);
+    
     _loadCurrentSettings();
-    _checkPermissions();
+    _checkPlatformCapabilities();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _statsTimer?.cancel();
+    _monitoringTimer?.cancel();
+    _networkSubscription?.cancel();
+    _appStateTimer?.cancel();
+    _appMonitor?.stopMonitoring();
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+    
+    _currentAppState = state;
+    _lastAppStateChange = DateTime.now();
+    
+    if (!_isCollecting) return;
+    
+    final serverUrl = _settings.getServerUrl();
+    if (serverUrl.isEmpty) return;
+    
+    try {
+      String stateName = '';
+      String description = '';
+      
+      switch (state) {
+        case AppLifecycleState.resumed:
+          stateName = 'FOREGROUND';
+          description = 'App came to foreground';
+          break;
+        case AppLifecycleState.inactive:
+          stateName = 'INACTIVE';
+          description = 'App is inactive';
+          break;
+        case AppLifecycleState.paused:
+          stateName = 'BACKGROUND';
+          description = 'App went to background';
+          break;
+        case AppLifecycleState.detached:
+          stateName = 'DETACHED';
+          description = 'App is detached';
+          break;
+        case AppLifecycleState.hidden:
+          stateName = 'HIDDEN';
+          description = 'App is hidden';
+          break;
+      }
+      
+      _logAppState(stateName, description);
+    } catch (e) {
+      print('App lifecycle error: $e');
+    }
+  }
+
+  Future<void> _logAppState(String state, String description) async {
+    try {
+      final serverUrl = _settings.getServerUrl();
+      if (serverUrl.isEmpty) return;
+      
+      final message = '📱 App State: $state\n'
+                     '• Description: $description\n'
+                     '• Time: ${DateTime.now().toIso8601String()}';
+      
+      await _logSender.sendCustomLog(serverUrl, '', message, 'INFO');
+      print('App state logged: $state');
+      
+      // Store for offline if needed
+      if (!await _logSender.sendCustomLog(serverUrl, '', message, 'INFO')) {
+        await BackgroundLogger.storeLogOffline('App state: $state - $description');
+      }
+    } catch (e) {
+      print('Error logging app state: $e');
+      await BackgroundLogger.storeLogOffline('App state $state failed: $e');
+    }
+  }
+
+  Future<void> _checkPlatformCapabilities() async {
+    try {
+      await AdvancedMonitor.isMonitoringRunning();
+    } catch (e) {
+      if (e.toString().contains('MissingPluginException')) {
+        print('⚠️ Native platform channels not available');
+        setState(() {
+          _showNativeWarning = true;
+        });
+
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text(
+                '⚠️ Native features unavailable - using basic monitoring',
+              ),
+              backgroundColor: Colors.orange,
+              duration: Duration(seconds: 5),
+            ),
+          );
+        });
+      }
+    }
   }
 
   Future<void> _loadCurrentSettings() async {
@@ -53,104 +174,32 @@ class _HomeScreenState extends State<HomeScreen> {
       _serverAddress = serverUrl;
     });
 
-    // Save server URL for native components if configured
-    if (serverUrl.isNotEmpty) {
-      try {
-        await _channel.invokeMethod('saveServerUrl', {'url': serverUrl});
-        print('[HomeScreen] Server URL loaded and saved for native components');
-      } catch (e) {
-        print('[HomeScreen] Warning: Could not save server URL to native: $e');
-      }
-    }
-
-    // Check if monitoring service is running
     await _checkMonitoringStatus();
+    await _updateStats();
+
+    // Start periodic stats update
+    _statsTimer = Timer.periodic(const Duration(seconds: 10), (timer) async {
+      if (_isCollecting) {
+        await _updateStats();
+      }
+    });
   }
 
-  Future<void> _testNativeReceivers() async {
-    if (!_isConfigured) {
-      _showMessage('Configure server first', isError: true);
-      return;
-    }
+  Future<void> _updateStats() async {
+    if (!mounted) return;
 
-    _showMessage('Testing native receivers...');
+    final pendingLogs = await BackgroundLogger.getPendingLogsCount();
+    final appEvents = await BackgroundLogger.getAppEventsCount();
 
     setState(() {
-      _isTesting = true;
+      _pendingLogsCount = pendingLogs;
+      _appEventsCount = appEvents;
     });
-
-    try {
-      // Trigger a test event via native
-      final success =
-          await _advancedChannel.invokeMethod<bool>('triggerTestEvent') ??
-          false;
-
-      if (success) {
-        _showMessage(
-          'Native receivers test triggered. Check Wazuh server for test logs.',
-        );
-
-        // Show instructions
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          showDialog(
-            context: context,
-            builder: (context) => AlertDialog(
-              title: const Text('Native Receivers Test'),
-              content: const Text(
-                'Native components (Screen, Power, App Install receivers) have been triggered.\n\n'
-                'Check your Wazuh server for test logs:\n'
-                'sudo tail -f /var/ossec/logs/archives/archives.log | grep -i "TEST_EVENT"\n\n'
-                'You should see test logs from:\n'
-                '• Screen receiver\n'
-                '• Power receiver\n'
-                '• App install receiver',
-              ),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.pop(context),
-                  child: const Text('OK'),
-                ),
-              ],
-            ),
-          );
-        });
-      } else {
-        _showMessage('Failed to trigger native receivers test', isError: true);
-      }
-    } catch (e) {
-      print('Native receivers test error: $e');
-      _showMessage('Error: $e', isError: true);
-    } finally {
-      setState(() {
-        _isTesting = false;
-      });
-    }
-  }
-
-  Future<void> _checkPermissions() async {
-    try {
-      final hasAllPermissions =
-          await _channel.invokeMethod<bool>('checkPermissions') ?? false;
-      final hasUsagePerm =
-          await _channel.invokeMethod<bool>('hasUsageStatsPermission') ?? false;
-
-      setState(() {
-        _hasUsagePermission = hasUsagePerm;
-      });
-
-      if (!hasAllPermissions) {
-        await _channel.invokeMethod('checkAndRequestAllPermissions');
-      }
-    } catch (e) {
-      print('Error checking permissions: $e');
-    }
   }
 
   Future<void> _checkMonitoringStatus() async {
     try {
-      final isRunning =
-          await _advancedChannel.invokeMethod<bool>('isMonitoringRunning') ??
-          false;
+      final isRunning = await AdvancedMonitor.isMonitoringRunning();
       setState(() {
         _isAdvancedMonitoring = isRunning;
       });
@@ -166,7 +215,7 @@ class _HomeScreenState extends State<HomeScreen> {
     final apiKey = _settings.getApiKey();
 
     if (serverUrl.isEmpty) {
-      _showMessage('Please configure server address first', isError: true);
+      _showMessage('Configure server address first', isError: true);
       return;
     }
 
@@ -176,9 +225,8 @@ class _HomeScreenState extends State<HomeScreen> {
 
     _showMessage('Testing connection...');
 
-    bool isConnected;
-
     try {
+      bool isConnected;
       if (apiKey.isEmpty) {
         isConnected = await ConnectionTester.testUdp(serverUrl);
       } else {
@@ -186,13 +234,12 @@ class _HomeScreenState extends State<HomeScreen> {
       }
 
       if (isConnected) {
-        _showMessage('Connection successful to $_serverAddress');
+        _showMessage('✅ Connection successful');
       } else {
-        _showMessage('Connection failed to $_serverAddress', isError: true);
+        _showMessage('❌ Connection failed', isError: true);
       }
     } catch (e) {
-      print('Connection test error: $e');
-      _showMessage('Test error: $e', isError: true);
+      _showMessage('❌ Connection error: $e', isError: true);
     } finally {
       setState(() {
         _isTesting = false;
@@ -217,81 +264,13 @@ class _HomeScreenState extends State<HomeScreen> {
 
     try {
       final success = await _logSender.sendTestLog(serverUrl, apiKey);
-
       if (success) {
-        _showMessage('Test log sent to $_serverAddress');
-
-        // Show verification instructions
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          _showVerificationInstructions();
-        });
+        _showMessage('✅ Test log sent successfully');
       } else {
-        _showMessage('Failed to send test log', isError: true);
+        _showMessage('❌ Failed to send test log', isError: true);
       }
     } catch (e) {
-      print('Test log error: $e');
-      _showMessage('Error: $e', isError: true);
-    } finally {
-      setState(() {
-        _isTesting = false;
-      });
-    }
-  }
-
-  Future<void> _sendMultipleTestLogs() async {
-    final serverUrl = _settings.getServerUrl();
-    final apiKey = _settings.getApiKey();
-
-    if (serverUrl.isEmpty) {
-      _showMessage('Configure server first', isError: true);
-      return;
-    }
-
-    _showMessage('Sending multiple test formats...');
-
-    setState(() {
-      _isTesting = true;
-    });
-
-    try {
-      final results = await _logSender.sendMultipleTestLogs(serverUrl, apiKey);
-
-      final successCount = results.where((r) => r).length;
-
-      if (successCount > 0) {
-        _showMessage(
-          '$successCount out of ${results.length} test logs sent successfully',
-        );
-
-        // Show verification help
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          showDialog(
-            context: context,
-            builder: (context) => AlertDialog(
-              title: const Text('Check Wazuh Server'),
-              content: const Text(
-                'Test logs sent with 3 different formats:\n'
-                '1. Syslog format (RFC3164)\n'
-                '2. Simple text format\n'
-                '3. Key=Value format\n\n'
-                'Check Wazuh logs to see which format is accepted:\n'
-                'sudo tail -f /var/ossec/logs/archives/archives.log',
-              ),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.pop(context),
-                  child: const Text('OK'),
-                ),
-              ],
-            ),
-          );
-        });
-      } else {
-        _showMessage('All test logs failed', isError: true);
-      }
-    } catch (e) {
-      print('Multiple test logs error: $e');
-      _showMessage('Error: $e', isError: true);
+      _showMessage('❌ Error: $e', isError: true);
     } finally {
       setState(() {
         _isTesting = false;
@@ -309,7 +288,7 @@ class _HomeScreenState extends State<HomeScreen> {
     }
 
     TextEditingController messageController = TextEditingController(
-      text: 'Custom test log from MHF Log Shield app',
+      text: 'Test log from MHF Log Shield ${DateTime.now().toIso8601String()}',
     );
     String selectedLevel = 'INFO';
 
@@ -322,17 +301,15 @@ class _HomeScreenState extends State<HomeScreen> {
             mainAxisSize: MainAxisSize.min,
             children: [
               DropdownButtonFormField<String>(
-                initialValue: selectedLevel,
-                items: ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']
+                value: selectedLevel,
+                items: ['INFO', 'WARNING', 'ERROR']
                     .map(
                       (level) =>
                           DropdownMenuItem(value: level, child: Text(level)),
                     )
                     .toList(),
                 onChanged: (value) {
-                  if (value != null) {
-                    selectedLevel = value;
-                  }
+                  if (value != null) selectedLevel = value;
                 },
                 decoration: const InputDecoration(labelText: 'Log Level'),
               ),
@@ -340,8 +317,8 @@ class _HomeScreenState extends State<HomeScreen> {
               TextFormField(
                 controller: messageController,
                 decoration: const InputDecoration(
-                  labelText: 'Log Message',
-                  hintText: 'Enter test message',
+                  labelText: 'Message',
+                  hintText: 'Enter log message',
                 ),
                 maxLines: 3,
               ),
@@ -374,59 +351,12 @@ class _HomeScreenState extends State<HomeScreen> {
               });
 
               if (success) {
-                _showMessage('Custom log sent successfully');
+                _showMessage('✅ Custom log sent');
               } else {
-                _showMessage('Failed to send custom log', isError: true);
+                _showMessage('❌ Failed to send custom log', isError: true);
               }
             },
             child: const Text('Send'),
-          ),
-        ],
-      ),
-    );
-  }
-
-  void _showVerificationInstructions() {
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Verify on Wazuh Server'),
-        content: SingleChildScrollView(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Text('To verify logs reached Wazuh:'),
-              const SizedBox(height: 16),
-              const Text('1. On Wazuh server (192.168.0.117), run:'),
-              const SizedBox(height: 8),
-              Container(
-                padding: const EdgeInsets.all(12),
-                color: Colors.black87,
-                child: const SelectableText(
-                  '# Check if logs appear in archives\n'
-                  'sudo tail -f /var/ossec/logs/archives/archives.log | grep -i mhf\n\n'
-                  '# Check alerts\n'
-                  'sudo tail -f /var/ossec/logs/alerts/alerts.log | grep -i mhf',
-                  style: TextStyle(
-                    color: Colors.white,
-                    fontFamily: 'Monospace',
-                    fontSize: 12,
-                  ),
-                ),
-              ),
-              const SizedBox(height: 16),
-              const Text('2. Check Wazuh dashboard:'),
-              const Text('   • Go to Security Events'),
-              const Text('   • Filter by: app_name:MHF_Log_Shield'),
-              const Text('   • Or search for: MHFLogShield'),
-            ],
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('OK'),
           ),
         ],
       ),
@@ -441,129 +371,32 @@ class _HomeScreenState extends State<HomeScreen> {
 
     final newState = !_isCollecting;
 
-    // Update settings first
-    await _settings.setCollectLogs(newState);
-
-    setState(() {
-      _isCollecting = newState;
-    });
-
-    if (newState) {
-      // START ADVANCED MONITORING
-      try {
-        // First, ensure server URL is saved for native components
-        final serverUrl = _settings.getServerUrl();
-        if (serverUrl.isNotEmpty) {
-          try {
-            await _channel.invokeMethod('saveServerUrl', {'url': serverUrl});
-            print(
-              '[HomeScreen] Server URL saved for native components: $serverUrl',
-            );
-          } catch (e) {
-            print(
-              '[HomeScreen] Warning: Could not save server URL to native: $e',
-            );
-            // Continue anyway - native components might use fallback
-          }
-        }
-
-        // Start basic foreground service
-        await _channel.invokeMethod('startForegroundService');
-
-        // Start advanced monitoring service
-        await _advancedChannel.invokeMethod('startMonitoringService');
-
-        // Send initial confirmation
-        await _sendInitialConfirmationLog();
-
-        // Update monitoring status
-        await _checkMonitoringStatus();
-
-        _showMessage('Advanced monitoring started - Real-time tracking active');
-      } catch (e) {
-        print('Error starting monitoring: $e');
-        _showMessage('Error starting: $e', isError: true);
-        // Revert state on error
-        await _settings.setCollectLogs(false);
-        setState(() {
-          _isCollecting = false;
-        });
-      }
-    } else {
-      // STOP ADVANCED MONITORING
-      try {
-        await _advancedChannel.invokeMethod('stopMonitoringService');
-        await _channel.invokeMethod('stopForegroundService');
-
-        await _sendStopConfirmationLog();
-        await _checkMonitoringStatus();
-
-        _showMessage('Monitoring stopped');
-      } catch (e) {
-        print('Error stopping monitoring: $e');
-        _showMessage('Error stopping: $e', isError: true);
-      }
-    }
-  }
-
-  Future<void> _sendInitialConfirmationLog() async {
-    final serverUrl = _settings.getServerUrl();
-    final apiKey = _settings.getApiKey();
-
-    if (serverUrl.isEmpty) return;
-
-    try {
-      final message =
-          '🚀 MHF Log Shield | ADVANCED MONITORING STARTED | '
-          'Device: ${Platform.operatingSystem} | '
-          'Real-time tracking: ENABLED';
-      await _logSender.sendCustomLog(serverUrl, apiKey, message, 'INFO');
-      print('[HomeScreen] Advanced monitoring started log sent');
-    } catch (e) {
-      print('[HomeScreen] Error sending initial log: $e');
-    }
-  }
-
-  Future<void> _sendStopConfirmationLog() async {
-    final serverUrl = _settings.getServerUrl();
-    final apiKey = _settings.getApiKey();
-
-    if (serverUrl.isEmpty) return;
-
-    try {
-      final message =
-          '🛑 MHF Log Shield | MONITORING STOPPED | '
-          'Device: ${Platform.operatingSystem}';
-      await _logSender.sendCustomLog(serverUrl, apiKey, message, 'INFO');
-      print('[HomeScreen] Stop confirmation log sent');
-    } catch (e) {
-      print('[HomeScreen] Error sending stop log: $e');
-    }
-  }
-
-  Future<void> _debugLogSending() async {
-    final serverUrl = _settings.getServerUrl();
-    if (serverUrl.isEmpty) {
-      _showMessage('Configure server first', isError: true);
-      return;
-    }
-
     setState(() {
       _isTesting = true;
     });
 
-    _showMessage('Running debug tests...');
-
     try {
-      final success = await LogSender.debugLogSending(serverUrl);
-
-      if (success) {
-        _showMessage('Debug test PASSED - logs should send');
+      if (newState) {
+        // START ALL MONITORING
+        await _startBasicMonitoring();
+        await _startAppMonitoring();
+        await _settings.setCollectLogs(true);
+        setState(() {
+          _isCollecting = true;
+        });
+        _showMessage('✅ Monitoring started');
       } else {
-        _showMessage('Debug test FAILED - check console logs', isError: true);
+        // STOP ALL MONITORING
+        await _stopBasicMonitoring();
+        await _stopAppMonitoring();
+        await _settings.setCollectLogs(false);
+        setState(() {
+          _isCollecting = false;
+        });
+        _showMessage('⏹️ Monitoring stopped');
       }
     } catch (e) {
-      _showMessage('Debug error: $e', isError: true);
+      _showMessage('❌ Error: $e', isError: true);
     } finally {
       setState(() {
         _isTesting = false;
@@ -571,87 +404,313 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  Future<void> _checkMonitoringStats() async {
-    _showMessage('Checking monitoring statistics...');
+  Future<void> _startBasicMonitoring() async {
+    print('Starting basic monitoring');
+    
+    // Start real-time network monitoring
+    _networkSubscription = Connectivity().onConnectivityChanged.listen((results) async {
+      if (results.isNotEmpty && _isCollecting) {
+        final networkStr = _getNetworkTypeString(results.first);
+        
+        try {
+          final serverUrl = _settings.getServerUrl();
+          if (serverUrl.isEmpty) return;
+          
+          final message = '🌐 Network changed: $networkStr\n'
+                         '• Time: ${DateTime.now().toIso8601String()}';
+          await _logSender.sendCustomLog(serverUrl, '', message, 'INFO');
+          print('Network change logged: $networkStr');
+        } catch (e) {
+          print('Network monitoring error: $e');
+          await BackgroundLogger.storeLogOffline('Network change failed: $e');
+        }
+      }
+    });
+    
+    // Start simple periodic logging
+    _monitoringTimer = Timer.periodic(const Duration(minutes: 5), (timer) async {
+      if (!_isCollecting) {
+        timer.cancel();
+        return;
+      }
+      
+      try {
+        final serverUrl = _settings.getServerUrl();
+        if (serverUrl.isEmpty) return;
 
+        final battery = Battery();
+        final connectivity = Connectivity();
+
+        final batteryLevel = await battery.batteryLevel;
+        final networkResults = await connectivity.checkConnectivity();
+        final networkStr = networkResults.isNotEmpty
+            ? _getNetworkTypeString(networkResults.first)
+            : 'No Connection';
+
+        final message =
+            '📊 Basic Status | '
+            'Platform: ${Platform.operatingSystem} | '
+            'Battery: $batteryLevel% | '
+            'Network: $networkStr';
+
+        await _logSender.sendCustomLog(serverUrl, '', message, 'INFO');
+        print('Basic status logged');
+      } catch (e) {
+        print('Basic monitoring error: $e');
+        await BackgroundLogger.storeLogOffline('Basic status failed: $e');
+      }
+    });
+  }
+
+  Future<void> _stopBasicMonitoring() async {
+    print('Stopping basic monitoring');
+    _monitoringTimer?.cancel();
+    _monitoringTimer = null;
+    _networkSubscription?.cancel();
+    _networkSubscription = null;
+  }
+
+  Future<void> _startAppMonitoring() async {
     try {
-      final stats = await _advancedChannel.invokeMethod<Map<dynamic, dynamic>>(
-        'getMonitoringStats',
-      );
-      final eventsCount = await _advancedChannel
-          .invokeMethod<Map<dynamic, dynamic>>('getPendingEventsCount');
+      // Start App Monitor for app install/uninstall detection
+      _appMonitor = AppMonitor(_settings, _logSender);
+      await _appMonitor!.startMonitoring();
+      print('✅ App monitoring started');
+      
+      // Start Background Logger for offline storage
+      await BackgroundLogger.startLogging();
+      print('✅ Background logging started');
+      
+      // Start app state monitoring
+      await _startAppStateMonitoring();
+      
+    } catch (e) {
+      print('⚠️ App monitoring error: $e');
+      // Fall back to basic only
+    }
+  }
 
+  Future<void> _stopAppMonitoring() async {
+    try {
+      if (_appMonitor != null) {
+        await _appMonitor!.stopMonitoring();
+        _appMonitor = null;
+        print('✅ App monitoring stopped');
+      }
+      
+      await BackgroundLogger.stopBackgroundMonitoring();
+      print('✅ Background logging stopped');
+      
+      _appStateTimer?.cancel();
+      _appStateTimer = null;
+      
+    } catch (e) {
+      print('⚠️ Error stopping app monitoring: $e');
+    }
+  }
+
+  Future<void> _startAppStateMonitoring() async {
+    try {
+      // Start a timer to periodically log app state
+      _appStateTimer = Timer.periodic(const Duration(minutes: 1), (timer) async {
+        if (!_isCollecting) {
+          timer.cancel();
+          return;
+        }
+        
+        await _logPeriodicAppState();
+      });
+      
+      print('✅ App state monitoring started');
+      
+    } catch (e) {
+      print('App state monitoring error: $e');
+    }
+  }
+
+  Future<void> _logPeriodicAppState() async {
+    try {
+      final serverUrl = _settings.getServerUrl();
+      if (serverUrl.isEmpty) return;
+      
+      // Get current time
+      final now = DateTime.now();
+      
+      // Log current app state
+      String appState = _currentAppState?.toString() ?? 'UNKNOWN';
+      String stateTime = _lastAppStateChange?.toIso8601String() ?? 'N/A';
+      
+      // Get app count if AppMonitor is running
+      int appCount = 0;
+      if (_appMonitor != null) {
+        appCount = await _appMonitor!.getInstalledAppsCount();
+      }
+      
+      final message = '📱 Periodic App State\n'
+                     '• Current State: $appState\n'
+                     '• Last Change: $stateTime\n'
+                     '• Installed Apps: $appCount\n'
+                     '• Time: ${now.toIso8601String()}';
+      
+      await _logSender.sendCustomLog(serverUrl, '', message, 'INFO');
+      print('Periodic app state logged');
+      
+    } catch (e) {
+      print('Error logging periodic app state: $e');
+      await BackgroundLogger.storeLogOffline('Periodic app state failed: $e');
+    }
+  }
+
+  String _getNetworkTypeString(ConnectivityResult result) {
+    switch (result) {
+      case ConnectivityResult.wifi:
+        return 'WiFi';
+      case ConnectivityResult.mobile:
+        return 'Mobile Data';
+      case ConnectivityResult.ethernet:
+        return 'Ethernet';
+      case ConnectivityResult.vpn:
+        return 'VPN';
+      case ConnectivityResult.bluetooth:
+        return 'Bluetooth';
+      case ConnectivityResult.other:
+        return 'Other';
+      default:
+        return 'No Connection';
+    }
+  }
+
+  Future<void> _checkMonitoringStats() async {
+    try {
+      final stats = await AdvancedMonitor.getMonitoringStats();
+      
+      // Get additional stats
+      int appCount = 0;
+      if (_appMonitor != null) {
+        appCount = await _appMonitor!.getInstalledAppsCount();
+      }
+      
+      final batteryStatus = await _battery.batteryState;
+      
       setState(() {
-        _monitoringStats = Map<String, dynamic>.from(stats ?? {});
+        _monitoringStats = {
+          ...stats,
+          'installed_apps': appCount,
+          'battery_state': batteryStatus.toString(),
+          'current_app_state': _currentAppState?.toString() ?? 'Unknown',
+          'last_app_state_change': _lastAppStateChange?.toIso8601String() ?? 'N/A',
+        };
       });
 
       showDialog(
         context: context,
         builder: (context) => AlertDialog(
-          title: const Text('Real-time Monitoring Statistics'),
+          title: const Text('Monitoring Statistics'),
           content: SingleChildScrollView(
             child: Column(
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
+                _buildStatItem('Status', _isCollecting ? 'Active' : 'Inactive'),
+                _buildStatItem('Pending Logs', '$_pendingLogsCount'),
+                _buildStatItem('App Events', '$_appEventsCount'),
+                _buildStatItem('Installed Apps', '${_monitoringStats['installed_apps']}'),
+                _buildStatItem('Current App State', _monitoringStats['current_app_state']),
+                if (_monitoringStats['last_app_state_change'] != 'N/A')
+                  _buildStatItem('Last State Change', _monitoringStats['last_app_state_change']),
+                _buildStatItem('Battery State', _monitoringStats['battery_state']),
+                if (_monitoringStats['current_interval'] != null)
+                  _buildStatItem(
+                    'Interval',
+                    '${_monitoringStats['current_interval']} seconds',
+                  ),
+              ],
+            ),
+          ),
+          actions: [
+            if (_pendingLogsCount > 0)
+              ElevatedButton(
+                onPressed: () async {
+                  Navigator.pop(context);
+                  await _sendPendingLogs();
+                },
+                child: const Text('Send Pending Logs'),
+              ),
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Close'),
+            ),
+          ],
+        ),
+      );
+    } catch (e) {
+      _showMessage('❌ Error checking stats: $e', isError: true);
+    }
+  }
+
+  Future<void> _sendPendingLogs() async {
+    _showMessage('Sending pending logs...');
+
+    setState(() {
+      _isTesting = true;
+    });
+
+    try {
+      await BackgroundLogger.sendPendingLogs();
+      await _updateStats();
+      _showMessage('✅ Pending logs sent');
+    } catch (e) {
+      _showMessage('❌ Error: $e', isError: true);
+    } finally {
+      setState(() {
+        _isTesting = false;
+      });
+    }
+  }
+
+  Future<void> _viewDeviceInfo() async {
+    try {
+      final batteryLevel = await _battery.batteryLevel;
+      final batteryState = await _battery.batteryState;
+      final networkResults = await _connectivity.checkConnectivity();
+      final networkStr = networkResults.isNotEmpty 
+          ? _getNetworkTypeString(networkResults.first)
+          : 'No Connection';
+
+      // Get app count if AppMonitor is running
+      int appCount = 0;
+      if (_appMonitor != null) {
+        appCount = await _appMonitor!.getInstalledAppsCount();
+      }
+
+      showDialog(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Device Information'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _buildStatItem('Platform', _platformName),
+                _buildStatItem('Battery', '$batteryLevel%'),
                 _buildStatItem(
-                  'Monitoring Service',
-                  _monitoringStats['is_running'] == true
-                      ? 'RUNNING ✅'
-                      : 'STOPPED ❌',
+                  'Battery State',
+                  _getBatteryStateString(batteryState),
                 ),
+                _buildStatItem('Network', networkStr),
                 _buildStatItem(
-                  'Current Interval',
-                  '${_monitoringStats['current_interval'] ?? 30} seconds',
+                  'Monitoring',
+                  _isCollecting ? 'Active' : 'Inactive',
                 ),
-                _buildStatItem(
-                  'Events Processed',
-                  '${_monitoringStats['events_processed'] ?? 0}',
-                ),
-                _buildStatItem(
-                  'Pending Events',
-                  '${_monitoringStats['pending_events'] ?? 0}',
-                ),
-                const SizedBox(height: 12),
-                const Text(
-                  '📊 Detailed Events:',
-                  style: TextStyle(fontWeight: FontWeight.bold),
-                ),
-                ..._buildDetailedEvents(eventsCount),
-                const SizedBox(height: 12),
-                const Text(
-                  '🔒 Permissions:',
-                  style: TextStyle(fontWeight: FontWeight.bold),
-                ),
-                _buildStatItem(
-                  'Usage Stats',
-                  _monitoringStats['has_usage_permission'] == true
-                      ? 'GRANTED ✅'
-                      : 'DENIED ❌',
-                ),
-                _buildStatItem(
-                  'Notifications',
-                  _monitoringStats['has_notification_permission'] == true
-                      ? 'GRANTED ✅'
-                      : 'DENIED ❌',
-                ),
-                const SizedBox(height: 12),
-                const Text(
-                  '📱 Recent Activity:',
-                  style: TextStyle(fontWeight: FontWeight.bold),
-                ),
-                _buildStatItem(
-                  'Last App',
-                  _monitoringStats['last_foreground_app']?.toString() ?? 'None',
-                ),
-                _buildStatItem(
-                  'Last Screen Event',
-                  _monitoringStats['last_screen_event']?.toString() ?? 'None',
-                ),
-                _buildStatItem(
-                  'Last Power Event',
-                  _monitoringStats['last_power_event']?.toString() ?? 'None',
-                ),
+                if (_isCollecting)
+                  _buildStatItem('Apps Monitored', '$appCount'),
+                if (_currentAppState != null)
+                  _buildStatItem('App State', _currentAppState.toString()),
+                if (_lastAppStateChange != null)
+                  _buildStatItem('Last State Change', _lastAppStateChange!.toIso8601String()),
+                if (_showNativeWarning)
+                  _buildStatItem('Note', 'Using basic monitoring mode'),
               ],
             ),
           ),
@@ -660,118 +719,25 @@ class _HomeScreenState extends State<HomeScreen> {
               onPressed: () => Navigator.pop(context),
               child: const Text('Close'),
             ),
-            if ((_monitoringStats['pending_events'] as int? ?? 0) > 0)
-              TextButton(
-                onPressed: () async {
-                  await _advancedChannel.invokeMethod('clearMonitoringData');
-                  Navigator.pop(context);
-                  _showMessage('Monitoring data cleared');
-                },
-                child: const Text('Clear Data'),
-              ),
           ],
         ),
       );
     } catch (e) {
-      print('Error getting monitoring stats: $e');
-      _showMessage('Error checking service: $e', isError: true);
+      _showMessage('❌ Error: $e', isError: true);
     }
   }
 
-  List<Widget> _buildDetailedEvents(Map<dynamic, dynamic>? eventsCount) {
-    final counts = Map<String, dynamic>.from(eventsCount ?? {});
-    return counts.entries.map((entry) {
-      return Padding(
-        padding: const EdgeInsets.symmetric(vertical: 2),
-        child: Row(
-          children: [
-            const SizedBox(width: 16),
-            Text(
-              '• ${entry.key}: ',
-              style: const TextStyle(fontWeight: FontWeight.w500),
-            ),
-            Text('${entry.value}'),
-          ],
-        ),
-      );
-    }).toList();
-  }
-
-  Future<void> _requestUsagePermission() async {
-    try {
-      await _channel.invokeMethod('requestUsageStatsPermission');
-      _showMessage('Please grant permission in settings');
-      await Future.delayed(const Duration(seconds: 2));
-      await _checkPermissions();
-    } catch (e) {
-      print('Error requesting usage permission: $e');
-      _showMessage('Error requesting permission: $e', isError: true);
+  String _getBatteryStateString(BatteryState state) {
+    switch (state) {
+      case BatteryState.full:
+        return 'Full';
+      case BatteryState.charging:
+        return 'Charging';
+      case BatteryState.discharging:
+        return 'Discharging';
+      default:
+        return 'Unknown';
     }
-  }
-
-  Future<void> _setMonitoringInterval() async {
-    TextEditingController intervalController = TextEditingController(
-      text: (_monitoringStats['current_interval'] ?? 30).toString(),
-    );
-
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Set Monitoring Interval'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Text('Set how often to check for changes (in seconds).'),
-            const SizedBox(height: 16),
-            const Text('Recommended intervals:'),
-            const Text('• 10-30 seconds: High accuracy (battery impact)'),
-            const Text('• 30-60 seconds: Balanced'),
-            const Text('• 60-300 seconds: Battery saving'),
-            const SizedBox(height: 16),
-            TextFormField(
-              controller: intervalController,
-              keyboardType: TextInputType.number,
-              decoration: const InputDecoration(
-                labelText: 'Interval (seconds)',
-                hintText: 'Enter interval in seconds',
-              ),
-              validator: (value) {
-                if (value == null || value.isEmpty)
-                  return 'Please enter interval';
-                final intVal = int.tryParse(value);
-                if (intVal == null || intVal < 5) return 'Minimum 5 seconds';
-                return null;
-              },
-            ),
-          ],
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Cancel'),
-          ),
-          ElevatedButton(
-            onPressed: () async {
-              final interval = int.tryParse(intervalController.text);
-              if (interval != null && interval >= 5) {
-                await _advancedChannel.invokeMethod('setMonitoringInterval', {
-                  'seconds': interval,
-                });
-                Navigator.pop(context);
-                _showMessage('Monitoring interval set to $interval seconds');
-                await _checkMonitoringStats();
-              } else {
-                _showMessage(
-                  'Please enter a valid interval (minimum 5 seconds)',
-                  isError: true,
-                );
-              }
-            },
-            child: const Text('Set'),
-          ),
-        ],
-      ),
-    );
   }
 
   void _showMessage(String message, {bool isError = false}) {
@@ -790,6 +756,15 @@ class _HomeScreenState extends State<HomeScreen> {
       appBar: AppBar(
         title: const Text('MHF Log Shield'),
         actions: [
+          if (_pendingLogsCount > 0)
+            Badge(
+              label: Text('$_pendingLogsCount'),
+              child: IconButton(
+                icon: const Icon(Icons.cloud_upload),
+                onPressed: _sendPendingLogs,
+                tooltip: 'Send Pending Logs',
+              ),
+            ),
           IconButton(
             icon: const Icon(Icons.settings),
             onPressed: () async {
@@ -802,24 +777,16 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
         ],
       ),
-      body: _buildBody(),
-    );
-  }
-
-  Widget _buildBody() {
-    return SingleChildScrollView(
-      child: Padding(
-        padding: const EdgeInsets.all(20),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(16),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             _buildStatusCard(),
-            const SizedBox(height: 20),
-            _buildCollectionCard(),
-            const SizedBox(height: 20),
+            const SizedBox(height: 16),
+            _buildStatsCard(),
+            const SizedBox(height: 16),
             _buildControlButtons(),
-            const SizedBox(height: 20),
-            _buildInfoSection(),
           ],
         ),
       ),
@@ -832,12 +799,16 @@ class _HomeScreenState extends State<HomeScreen> {
         padding: const EdgeInsets.all(16),
         child: Column(
           children: [
-            const Icon(Icons.shield, size: 50, color: Colors.blue),
-            const SizedBox(height: 10),
+            Icon(
+              _isCollecting ? Icons.security : Icons.security_outlined,
+              size: 48,
+              color: _isCollecting ? Colors.green : Colors.blue,
+            ),
+            const SizedBox(height: 12),
             Text(
               _isConfigured ? 'Ready' : 'Not Configured',
               style: TextStyle(
-                fontSize: 20,
+                fontSize: 18,
                 fontWeight: FontWeight.bold,
                 color: _isConfigured ? Colors.green : Colors.orange,
               ),
@@ -850,101 +821,105 @@ class _HomeScreenState extends State<HomeScreen> {
                 textAlign: TextAlign.center,
               ),
               const SizedBox(height: 4),
-              Text(
-                'Mode: $_connectionMode',
-                style: const TextStyle(
-                  fontSize: 12,
-                  fontWeight: FontWeight.bold,
-                  color: Colors.blue,
+              Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 4,
+                ),
+                decoration: BoxDecoration(
+                  color: Colors.blue.withOpacity(0.1),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Text(
+                  'Mode: $_connectionMode',
+                  style: const TextStyle(
+                    fontSize: 12,
+                    color: Colors.blue,
+                    fontWeight: FontWeight.bold,
+                  ),
                 ),
               ),
-              const SizedBox(height: 8),
-              if (_isAdvancedMonitoring)
-                Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 12,
-                    vertical: 6,
-                  ),
-                  decoration: BoxDecoration(
-                    color: Colors.green.withOpacity(0.1),
-                    borderRadius: BorderRadius.circular(20),
-                    border: Border.all(color: Colors.green),
-                  ),
-                  child: const Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(
-                        Icons.notifications_active,
-                        size: 14,
+            ],
+            const SizedBox(height: 8),
+            if (_showNativeWarning)
+              Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 6,
+                ),
+                decoration: BoxDecoration(
+                  color: Colors.orange.withOpacity(0.1),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.warning, size: 14, color: Colors.orange),
+                    const SizedBox(width: 6),
+                    const Text(
+                      'Basic Mode',
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: Colors.orange,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ],
+                ),
+              )
+            else if (_isCollecting)
+              Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 6,
+                ),
+                decoration: BoxDecoration(
+                  color: Colors.green.withOpacity(0.1),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.circle, size: 8, color: Colors.green),
+                    const SizedBox(width: 6),
+                    const Text(
+                      'Active',
+                      style: TextStyle(
+                        fontSize: 12,
                         color: Colors.green,
+                        fontWeight: FontWeight.bold,
                       ),
-                      SizedBox(width: 4),
-                      Text(
-                        'REAL-TIME MONITORING',
-                        style: TextStyle(
-                          fontSize: 12,
-                          color: Colors.green,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
-                    ],
-                  ),
-                )
-              else if (_isCollecting)
-                Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 12,
-                    vertical: 6,
-                  ),
-                  decoration: BoxDecoration(
-                    color: Colors.blue.withOpacity(0.1),
-                    borderRadius: BorderRadius.circular(20),
-                    border: Border.all(color: Colors.blue),
-                  ),
-                  child: const Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(Icons.timer, size: 14, color: Colors.blue),
-                      SizedBox(width: 4),
-                      Text(
-                        'PERIODIC MONITORING',
-                        style: TextStyle(
-                          fontSize: 12,
-                          color: Colors.blue,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
-                    ],
-                  ),
+                    ),
+                  ],
                 ),
-              if (!_hasUsagePermission && _isCollecting)
-                Container(
-                  margin: const EdgeInsets.only(top: 8),
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 12,
-                    vertical: 6,
-                  ),
-                  decoration: BoxDecoration(
-                    color: Colors.orange.withOpacity(0.1),
-                    borderRadius: BorderRadius.circular(20),
-                    border: Border.all(color: Colors.orange),
-                  ),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      const Icon(Icons.warning, size: 14, color: Colors.orange),
-                      const SizedBox(width: 4),
-                      Text(
-                        'MISSING PERMISSION',
-                        style: TextStyle(
-                          fontSize: 10,
-                          color: Colors.orange,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
-                    ],
-                  ),
+              ),
+            if (_currentAppState != null && _isCollecting) ...[
+              const SizedBox(height: 8),
+              Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 6,
                 ),
+                decoration: BoxDecoration(
+                  color: Colors.purple.withOpacity(0.1),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.apps, size: 14, color: Colors.purple),
+                    const SizedBox(width: 6),
+                    Text(
+                      'App: ${_currentAppState.toString().split('.').last}',
+                      style: const TextStyle(
+                        fontSize: 12,
+                        color: Colors.purple,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
             ],
           ],
         ),
@@ -952,81 +927,79 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Widget _buildCollectionCard() {
+  Widget _buildStatsCard() {
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(16),
-        child: Row(
+        child: Column(
           children: [
-            Icon(
-              _isCollecting ? Icons.play_arrow : Icons.stop,
-              color: _isCollecting ? Colors.green : Colors.red,
-              size: 30,
+            const Row(
+              children: [
+                Icon(Icons.analytics, size: 20, color: Colors.blue),
+                SizedBox(width: 8),
+                Text(
+                  'Monitoring Stats',
+                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                ),
+              ],
             ),
-            const SizedBox(width: 16),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    _isCollecting
-                        ? (_isAdvancedMonitoring
-                              ? 'Real-time Monitoring'
-                              : 'Periodic Monitoring')
-                        : 'Stopped',
-                    style: const TextStyle(
-                      fontWeight: FontWeight.bold,
-                      fontSize: 16,
-                    ),
-                  ),
-                  const SizedBox(height: 4),
-                  Text(
-                    _isCollecting
-                        ? '${_isAdvancedMonitoring ? 'Instant detection of:' : 'Checking every 15 min:'}\n'
-                              '• App installs/uninstalls\n'
-                              '• Screen on/off\n'
-                              '• App usage\n'
-                              '• Battery & network'
-                        : 'Collection is paused',
-                    style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
-                    maxLines: 5,
-                  ),
-                  if (_isCollecting) ...[
-                    const SizedBox(height: 8),
-                    Row(
-                      children: [
-                        Expanded(
-                          child: ElevatedButton.icon(
-                            onPressed: _checkMonitoringStats,
-                            icon: const Icon(Icons.analytics, size: 16),
-                            label: const Text('View Stats'),
-                            style: ElevatedButton.styleFrom(
-                              minimumSize: const Size(double.infinity, 36),
-                              backgroundColor: Colors.blue.shade50,
-                              foregroundColor: Colors.blue,
-                            ),
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                        if (_isAdvancedMonitoring)
-                          IconButton(
-                            onPressed: _setMonitoringInterval,
-                            icon: const Icon(Icons.timer, size: 20),
-                            tooltip: 'Set interval',
-                            style: IconButton.styleFrom(
-                              backgroundColor: Colors.blue.shade50,
-                              foregroundColor: Colors.blue,
-                            ),
-                          ),
-                      ],
-                    ),
-                  ],
-                ],
-              ),
+            const SizedBox(height: 12),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceAround,
+              children: [
+                _buildStatWidget(
+                  'Pending',
+                  '$_pendingLogsCount',
+                  Icons.cloud_upload,
+                  Colors.orange,
+                ),
+                _buildStatWidget(
+                  'App Events',
+                  '$_appEventsCount',
+                  Icons.apps,
+                  Colors.green,
+                ),
+                _buildStatWidget(
+                  'Status',
+                  _isCollecting ? 'ON' : 'OFF',
+                  _isCollecting ? Icons.play_arrow : Icons.stop,
+                  _isCollecting ? Colors.green : Colors.red,
+                ),
+              ],
             ),
           ],
         ),
       ),
+    );
+  }
+
+  Widget _buildStatWidget(
+    String label,
+    String value,
+    IconData icon,
+    Color color,
+  ) {
+    return Column(
+      children: [
+        Container(
+          padding: const EdgeInsets.all(8),
+          decoration: BoxDecoration(
+            color: color.withOpacity(0.1),
+            shape: BoxShape.circle,
+          ),
+          child: Icon(icon, size: 24, color: color),
+        ),
+        const SizedBox(height: 4),
+        Text(
+          value,
+          style: TextStyle(
+            fontSize: 18,
+            fontWeight: FontWeight.bold,
+            color: color,
+          ),
+        ),
+        Text(label, style: const TextStyle(fontSize: 12, color: Colors.grey)),
+      ],
     );
   }
 
@@ -1034,221 +1007,123 @@ class _HomeScreenState extends State<HomeScreen> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        // Configure/Start-Stop Button
-        if (_isConfigured)
-          ElevatedButton(
-            onPressed: _isTesting ? null : _toggleCollection,
-            style: ElevatedButton.styleFrom(
-              minimumSize: const Size(double.infinity, 50),
-              backgroundColor: _isCollecting ? Colors.red : Colors.green,
-              disabledBackgroundColor: Colors.grey,
-            ),
-            child: _isTesting
-                ? const SizedBox(
-                    height: 20,
-                    width: 20,
-                    child: CircularProgressIndicator(
-                      strokeWidth: 2,
-                      valueColor: AlwaysStoppedAnimation(Colors.white),
-                    ),
-                  )
-                : Row(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      Icon(_isCollecting ? Icons.stop : Icons.play_arrow),
-                      const SizedBox(width: 10),
-                      Text(
-                        _isCollecting ? 'Stop Monitoring' : 'Start Monitoring',
-                        style: const TextStyle(fontSize: 16),
-                      ),
-                    ],
+        // Start/Stop Monitoring Button
+        ElevatedButton.icon(
+          onPressed: _isTesting ? null : _toggleCollection,
+          icon: _isTesting
+              ? const SizedBox(
+                  height: 24,
+                  width: 24,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    valueColor: AlwaysStoppedAnimation(Colors.white),
                   ),
-          )
-        else
-          ElevatedButton(
+                )
+              : Icon(_isCollecting ? Icons.stop : Icons.play_arrow),
+          label: Text(
+            _isCollecting ? 'Stop Monitoring' : 'Start Monitoring',
+            style: const TextStyle(fontSize: 16),
+          ),
+          style: ElevatedButton.styleFrom(
+            padding: const EdgeInsets.symmetric(vertical: 16),
+            backgroundColor: _isCollecting ? Colors.red : Colors.green,
+          ),
+        ),
+
+        const SizedBox(height: 12),
+
+        // Server Configuration Button
+        if (!_isConfigured)
+          ElevatedButton.icon(
             onPressed: () {
               Navigator.push(
                 context,
                 MaterialPageRoute(builder: (context) => const SettingsScreen()),
               ).then((_) => _loadCurrentSettings());
             },
+            icon: const Icon(Icons.settings),
+            label: const Text(
+              'Configure Server',
+              style: TextStyle(fontSize: 16),
+            ),
             style: ElevatedButton.styleFrom(
-              minimumSize: const Size(double.infinity, 50),
-            ),
-            child: const Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                Icon(Icons.settings),
-                SizedBox(width: 10),
-                Text('Configure Server', style: TextStyle(fontSize: 16)),
-              ],
+              padding: const EdgeInsets.symmetric(vertical: 16),
             ),
           ),
 
-        const SizedBox(height: 12),
+        if (_isConfigured) ...[
+          const SizedBox(height: 12),
 
-        // Permission Request Button (if needed)
-        if (!_hasUsagePermission && Platform.isAndroid)
+          // Test Connection Button
+          ElevatedButton.icon(
+            onPressed: _isTesting ? null : _testConnection,
+            icon: _isTesting
+                ? const SizedBox(
+                    width: 20,
+                    height: 20,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                      valueColor: AlwaysStoppedAnimation(Colors.white),
+                    ),
+                  )
+                : const Icon(Icons.wifi),
+            label: const Text('Test Connection'),
+            style: ElevatedButton.styleFrom(
+              padding: const EdgeInsets.symmetric(vertical: 16),
+              backgroundColor: Colors.orange,
+            ),
+          ),
+
+          const SizedBox(height: 12),
+
+          // Send Test Log Button
+          ElevatedButton.icon(
+            onPressed: _isTesting ? null : _sendTestLog,
+            icon: const Icon(Icons.send),
+            label: const Text('Send Test Log'),
+            style: ElevatedButton.styleFrom(
+              padding: const EdgeInsets.symmetric(vertical: 16),
+            ),
+          ),
+
+          const SizedBox(height: 12),
+
+          // Device Info Button
           OutlinedButton.icon(
-            onPressed: _isTesting ? null : _requestUsagePermission,
-            icon: const Icon(Icons.lock_open, size: 18),
-            label: const Text('Grant App Usage Permission'),
+            onPressed: _isTesting ? null : _viewDeviceInfo,
+            icon: const Icon(Icons.phone_android),
+            label: const Text('Device Info'),
             style: OutlinedButton.styleFrom(
-              foregroundColor: Colors.orange,
-              side: const BorderSide(color: Colors.orange),
+              padding: const EdgeInsets.symmetric(vertical: 16),
             ),
           ),
 
-        const SizedBox(height: 12),
+          const SizedBox(height: 12),
 
-        // Test Connection Button
-        ElevatedButton.icon(
-          onPressed: _isTesting ? null : _testConnection,
-          icon: _isTesting
-              ? const SizedBox(
-                  width: 20,
-                  height: 20,
-                  child: CircularProgressIndicator(
-                    strokeWidth: 2,
-                    valueColor: AlwaysStoppedAnimation(Colors.white),
-                  ),
-                )
-              : const Icon(Icons.wifi),
-          label: const Text('Test Connection'),
-          style: ElevatedButton.styleFrom(
-            minimumSize: const Size(double.infinity, 50),
-            backgroundColor: Colors.orange,
-            disabledBackgroundColor: Colors.grey,
+          // Monitoring Statistics Button
+          ElevatedButton.icon(
+            onPressed: _isTesting ? null : _checkMonitoringStats,
+            icon: const Icon(Icons.analytics),
+            label: const Text('View Statistics'),
+            style: ElevatedButton.styleFrom(
+              padding: const EdgeInsets.symmetric(vertical: 16),
+              backgroundColor: Colors.blue,
+            ),
           ),
-        ),
 
-        const SizedBox(height: 12),
+          const SizedBox(height: 12),
 
-        // Send Test Log Button
-        ElevatedButton.icon(
-          onPressed: _isTesting ? null : _sendTestLog,
-          icon: const Icon(Icons.send),
-          label: const Text('Send Test Log'),
-          style: ElevatedButton.styleFrom(
-            minimumSize: const Size(double.infinity, 50),
-            backgroundColor: Colors.purple,
-            disabledBackgroundColor: Colors.grey,
-          ),
-        ),
-
-        const SizedBox(height: 12),
-
-        // Monitoring Stats Button
-        ElevatedButton.icon(
-          onPressed: _isTesting ? null : _checkMonitoringStats,
-          icon: const Icon(Icons.analytics),
-          label: const Text('Monitoring Statistics'),
-          style: ElevatedButton.styleFrom(
-            minimumSize: const Size(double.infinity, 50),
-            backgroundColor: Colors.blue,
-            disabledBackgroundColor: Colors.grey,
-          ),
-        ),
-
-        const SizedBox(height: 12),
-
-        // Multiple Format Test Button
-        OutlinedButton.icon(
-          onPressed: _isTesting ? null : _sendMultipleTestLogs,
-          icon: const Icon(Icons.format_list_bulleted, size: 18),
-          label: const Text('Test Multiple Formats'),
-        ),
-
-        const SizedBox(height: 12),
-
-        // Debug Button
-        OutlinedButton.icon(
-          onPressed: _isTesting ? null : _debugLogSending,
-          icon: const Icon(Icons.bug_report, size: 18),
-          label: const Text('Debug Log Sending'),
-          style: OutlinedButton.styleFrom(foregroundColor: Colors.orange),
-        ),
-
-        const SizedBox(height: 12),
-
-        // Test Native Receivers Button
-        OutlinedButton.icon(
-          onPressed: _isTesting ? null : _testNativeReceivers,
-          icon: const Icon(Icons.android, size: 18),
-          label: const Text('Test Native Receivers'),
-          style: OutlinedButton.styleFrom(foregroundColor: Colors.deepPurple),
-        ),
-
-        const SizedBox(height: 12),
-
-        // Set Interval Button (only when monitoring)
-        if (_isAdvancedMonitoring)
+          // Custom Log Button
           OutlinedButton.icon(
-            onPressed: _isTesting ? null : _setMonitoringInterval,
-            icon: const Icon(Icons.timer, size: 18),
-            label: const Text('Set Monitoring Interval'),
-            style: OutlinedButton.styleFrom(foregroundColor: Colors.teal),
+            onPressed: _isTesting ? null : _sendCustomLog,
+            icon: const Icon(Icons.edit),
+            label: const Text('Custom Log'),
+            style: OutlinedButton.styleFrom(
+              padding: const EdgeInsets.symmetric(vertical: 16),
+            ),
           ),
-
-        const SizedBox(height: 12),
-
-        // Custom Log Button
-        OutlinedButton.icon(
-          onPressed: _isTesting ? null : _sendCustomLog,
-          icon: const Icon(Icons.edit, size: 18),
-          label: const Text('Custom Log'),
-        ),
+        ],
       ],
-    );
-  }
-
-  Widget _buildInfoSection() {
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text(
-              'Monitoring Capabilities',
-              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
-            ),
-            const SizedBox(height: 12),
-            _buildCapabilityItem(
-              '✅ Instant Detection',
-              'App installs/uninstalls, Screen on/off',
-            ),
-            _buildCapabilityItem('⏱️ 2-5 Seconds', 'App foreground changes'),
-            _buildCapabilityItem(
-              '⏱️ 30 Seconds',
-              'Network connectivity changes',
-            ),
-            _buildCapabilityItem(
-              '⏱️ 1-5 Minutes',
-              'Battery level, App usage statistics',
-            ),
-            const SizedBox(height: 12),
-            const Text(
-              'Real-time Features:',
-              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
-            ),
-            const SizedBox(height: 8),
-            const Text('• App installation/uninstallation (instant)'),
-            const Text('• Screen ON/OFF detection (instant)'),
-            const Text('• Power connection events (instant)'),
-            const Text('• App foreground changes (2-5 seconds)'),
-            const Text('• Network type changes (30 seconds)'),
-            const Text('• Battery monitoring (1-5 minutes)'),
-            const SizedBox(height: 12),
-            const Text(
-              'To verify on Wazuh:',
-              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
-            ),
-            const Text('sudo tail -f /var/ossec/logs/archives/archives.log'),
-            const Text('Filter by: MHFLogShield or mobile-device'),
-          ],
-        ),
-      ),
     );
   }
 
@@ -1260,25 +1135,6 @@ class _HomeScreenState extends State<HomeScreen> {
           Text('$label:', style: const TextStyle(fontWeight: FontWeight.bold)),
           const SizedBox(width: 8),
           Expanded(child: Text(value)),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildCapabilityItem(String title, String description) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 4),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(title, style: const TextStyle(fontWeight: FontWeight.w500)),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Text(
-              description,
-              style: const TextStyle(fontSize: 12, color: Colors.grey),
-            ),
-          ),
         ],
       ),
     );

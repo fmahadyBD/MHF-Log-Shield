@@ -1,108 +1,135 @@
 import 'dart:async';
 import 'dart:io';
-import 'package:flutter/services.dart';
+import 'package:battery_plus/battery_plus.dart';
+import 'package:connectivity_plus/connectivity_plus.dart';
+import 'package:mhf_log_shield/data/repositories/settings_repository.dart';
+import 'package:mhf_log_shield/utils/log_sender.dart';
 
 class AdvancedMonitor {
-  static const MethodChannel _channel = MethodChannel('advanced_monitor_channel');
-  static Timer? _periodicTimer;
-  
-  // Start comprehensive monitoring
+  static Timer? _monitoringTimer;
+  static final Battery _battery = Battery();
+  static final Connectivity _connectivity = Connectivity();
+
+  /// Start monitoring
   static Future<void> startAdvancedMonitoring() async {
-    try {
-      // Start foreground service
-      await _channel.invokeMethod('startMonitoringService');
-      
-      // Start periodic checks in Dart (for data that doesn't need native)
-      _startDartMonitoring();
-      
-      print('[AdvancedMonitor] Advanced monitoring started');
-    } catch (e) {
-      print('[AdvancedMonitor] Error starting monitoring: $e');
-    }
-  }
-  
-  static void _startDartMonitoring() {
-    // Stop any existing timer
-    _periodicTimer?.cancel();
+    print('🟢 Starting monitoring');
     
-    // Start timers with different intervals
-    _periodicTimer = Timer.periodic(const Duration(seconds: 30), (timer) {
-      _performMonitoringTasks();
-    });
+    // Stop any existing timer
+    _monitoringTimer?.cancel();
+    
+    // Start new timer (every 5 minutes)
+    _monitoringTimer = Timer.periodic(
+      const Duration(minutes: 5),
+      (timer) async {
+        await _sendMonitoringData();
+      },
+    );
+    
+    // Send immediate status
+    await _sendMonitoringData();
   }
-  
-  static Future<void> _performMonitoringTasks() async {
-    try {
-      // Get monitoring data from native
-      final data = await _channel.invokeMethod('getMonitoringData');
-      print('[AdvancedMonitor] Monitoring data: $data');
-      
-      // Process and send logs
-      await _processMonitoringData(data);
-      
-    } catch (e) {
-      print('[AdvancedMonitor] Error in monitoring tasks: $e');
-    }
-  }
-  
-  static Future<void> _processMonitoringData(dynamic data) async {
-    // Process data and send logs using your LogSender
-    // This integrates with your existing logging system
-  }
-  
+
+  /// Stop monitoring
   static Future<void> stopAdvancedMonitoring() async {
-    try {
-      _periodicTimer?.cancel();
-      _periodicTimer = null;
-      
-      await _channel.invokeMethod('stopMonitoringService');
-      
-      print('[AdvancedMonitor] Advanced monitoring stopped');
-    } catch (e) {
-      print('[AdvancedMonitor] Error stopping monitoring: $e');
-    }
+    print('🔴 Stopping monitoring');
+    _monitoringTimer?.cancel();
+    _monitoringTimer = null;
   }
-  
-  // Check if monitoring service is running
+
+  /// Check if monitoring is running
   static Future<bool> isMonitoringRunning() async {
+    return _monitoringTimer != null;
+  }
+
+  /// Send monitoring data
+  static Future<void> _sendMonitoringData() async {
     try {
-      final isRunning = await _channel.invokeMethod('isMonitoringRunning');
-      return isRunning == true;
+      final settings = SettingsRepository();
+      await settings.initialize();
+      
+      final serverUrl = settings.getServerUrl();
+      if (serverUrl.isEmpty) return;
+      
+      // Get device info
+      final batteryLevel = await _battery.batteryLevel;
+      final networkResults = await _connectivity.checkConnectivity();
+      final networkType = _getNetworkType(networkResults);
+      final platform = Platform.operatingSystem;
+      
+      // Create message
+      final message = '📊 Device Status | '
+                      'Platform: $platform | '
+                      'Battery: $batteryLevel% | '
+                      'Network: $networkType';
+      
+      // Send to server
+      final logSender = LogSender();
+      await logSender.sendCustomLog(serverUrl, '', message, 'INFO');
+      
+      print('📤 Sent monitoring data');
     } catch (e) {
-      print('[AdvancedMonitor] Error checking service status: $e');
-      return false;
+      print('❌ Monitoring error: $e');
     }
   }
-  
-  // Get pending events count
-  static Future<Map<String, int>> getPendingEventsCount() async {
-    try {
-      final counts = await _channel.invokeMethod('getPendingEventsCount');
-      return Map<String, int>.from(counts);
-    } catch (e) {
-      print('[AdvancedMonitor] Error getting event counts: $e');
-      return {};
+
+  /// Get network type string
+  static String _getNetworkType(List<ConnectivityResult> results) {
+    if (results.isEmpty) return 'No Connection';
+    
+    switch (results.first) {
+      case ConnectivityResult.wifi: return 'WiFi';
+      case ConnectivityResult.mobile: return 'Mobile Data';
+      case ConnectivityResult.ethernet: return 'Ethernet';
+      case ConnectivityResult.vpn: return 'VPN';
+      case ConnectivityResult.bluetooth: return 'Bluetooth';
+      case ConnectivityResult.other: return 'Other';
+      default: return 'No Connection';
     }
   }
-  
-  // Set monitoring interval
-  static Future<void> setMonitoringInterval(int seconds) async {
-    try {
-      await _channel.invokeMethod('setMonitoringInterval', {'seconds': seconds});
-      print('[AdvancedMonitor] Monitoring interval set to $seconds seconds');
-    } catch (e) {
-      print('[AdvancedMonitor] Error setting interval: $e');
-    }
-  }
-  
-  // Get current monitoring stats
+
+  /// Get monitoring stats (simple version)
   static Future<Map<String, dynamic>> getMonitoringStats() async {
-    try {
-      final stats = await _channel.invokeMethod('getMonitoringStats');
-      return Map<String, dynamic>.from(stats);
-    } catch (e) {
-      print('[AdvancedMonitor] Error getting stats: $e');
-      return {};
+    return {
+      'is_running': _monitoringTimer != null,
+      'mode': 'Dart-only',
+      'platform': Platform.operatingSystem,
+    };
+  }
+
+  /// Set monitoring interval
+  static Future<void> setMonitoringInterval(int seconds) async {
+    print('⏰ Interval set to $seconds seconds');
+    
+    if (_monitoringTimer != null) {
+      // Restart with new interval
+      await stopAdvancedMonitoring();
+      _monitoringTimer = Timer.periodic(
+        Duration(seconds: seconds),
+        (timer) async {
+          await _sendMonitoringData();
+        },
+      );
     }
+  }
+
+  /// Other methods (just print, don't actually do anything)
+  static Future<void> testNativeReceivers() async {
+    print('📡 Native receivers not available in Dart-only mode');
+  }
+
+  static Future<void> testWazuhConnection() async {
+    print('🔗 Wazuh connection test not available');
+  }
+
+  static Future<void> saveServerUrlForNative(String serverUrl) async {
+    print('💾 Server URL saved: $serverUrl');
+  }
+
+  static Future<void> checkAndRequestPermissions() async {
+    print('🔓 Permissions not needed in Dart-only mode');
+  }
+
+  static Future<bool> hasUsageStatsPermission() async {
+    return false;
   }
 }
