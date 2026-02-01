@@ -18,7 +18,8 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen> {
+class _HomeScreenState extends State<HomeScreen>
+    with WidgetsBindingObserver {
   final SettingsRepository _settings = SettingsRepository();
   final LogSender _logSender = LogSender();
   final Battery _battery = Battery();
@@ -39,27 +40,104 @@ class _HomeScreenState extends State<HomeScreen> {
   int _appEventsCount = 0;
   Timer? _statsTimer;
   Timer? _monitoringTimer;
+  StreamSubscription<List<ConnectivityResult>>? _networkSubscription;
+  Timer? _appStateTimer;
+  AppLifecycleState? _currentAppState;
+  DateTime? _lastAppStateChange;
 
   @override
   void initState() {
     super.initState();
     _platformName = Platform.operatingSystem;
     _isAndroid = Platform.isAndroid;
+    
+    // Add observer for app lifecycle events
+    WidgetsBinding.instance.addObserver(this);
+    
     _loadCurrentSettings();
     _checkPlatformCapabilities();
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _statsTimer?.cancel();
     _monitoringTimer?.cancel();
+    _networkSubscription?.cancel();
+    _appStateTimer?.cancel();
     _appMonitor?.stopMonitoring();
     super.dispose();
   }
 
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+    
+    _currentAppState = state;
+    _lastAppStateChange = DateTime.now();
+    
+    if (!_isCollecting) return;
+    
+    final serverUrl = _settings.getServerUrl();
+    if (serverUrl.isEmpty) return;
+    
+    try {
+      String stateName = '';
+      String description = '';
+      
+      switch (state) {
+        case AppLifecycleState.resumed:
+          stateName = 'FOREGROUND';
+          description = 'App came to foreground';
+          break;
+        case AppLifecycleState.inactive:
+          stateName = 'INACTIVE';
+          description = 'App is inactive';
+          break;
+        case AppLifecycleState.paused:
+          stateName = 'BACKGROUND';
+          description = 'App went to background';
+          break;
+        case AppLifecycleState.detached:
+          stateName = 'DETACHED';
+          description = 'App is detached';
+          break;
+        case AppLifecycleState.hidden:
+          stateName = 'HIDDEN';
+          description = 'App is hidden';
+          break;
+      }
+      
+      _logAppState(stateName, description);
+    } catch (e) {
+      print('App lifecycle error: $e');
+    }
+  }
+
+  Future<void> _logAppState(String state, String description) async {
+    try {
+      final serverUrl = _settings.getServerUrl();
+      if (serverUrl.isEmpty) return;
+      
+      final message = '📱 App State: $state\n'
+                     '• Description: $description\n'
+                     '• Time: ${DateTime.now().toIso8601String()}';
+      
+      await _logSender.sendCustomLog(serverUrl, '', message, 'INFO');
+      print('App state logged: $state');
+      
+      // Store for offline if needed
+      if (!await _logSender.sendCustomLog(serverUrl, '', message, 'INFO')) {
+        await BackgroundLogger.storeLogOffline('App state: $state - $description');
+      }
+    } catch (e) {
+      print('Error logging app state: $e');
+      await BackgroundLogger.storeLogOffline('App state $state failed: $e');
+    }
+  }
+
   Future<void> _checkPlatformCapabilities() async {
     try {
-      // Test if native methods are available
       await AdvancedMonitor.isMonitoringRunning();
     } catch (e) {
       if (e.toString().contains('MissingPluginException')) {
@@ -285,7 +363,6 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  // In your _toggleCollection() method, replace everything with:
   Future<void> _toggleCollection() async {
     if (!_isConfigured) {
       _showMessage('Configure server first', isError: true);
@@ -300,16 +377,18 @@ class _HomeScreenState extends State<HomeScreen> {
 
     try {
       if (newState) {
-        // START BASIC MONITORING ONLY (no native calls)
+        // START ALL MONITORING
         await _startBasicMonitoring();
+        await _startAppMonitoring();
         await _settings.setCollectLogs(true);
         setState(() {
           _isCollecting = true;
         });
-        _showMessage('✅ Basic monitoring started');
+        _showMessage('✅ Monitoring started');
       } else {
-        // STOP BASIC MONITORING
+        // STOP ALL MONITORING
         await _stopBasicMonitoring();
+        await _stopAppMonitoring();
         await _settings.setCollectLogs(false);
         setState(() {
           _isCollecting = false;
@@ -325,11 +404,36 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  // And make sure these methods exist:
   Future<void> _startBasicMonitoring() async {
     print('Starting basic monitoring');
+    
+    // Start real-time network monitoring
+    _networkSubscription = Connectivity().onConnectivityChanged.listen((results) async {
+      if (results.isNotEmpty && _isCollecting) {
+        final networkStr = _getNetworkTypeString(results.first);
+        
+        try {
+          final serverUrl = _settings.getServerUrl();
+          if (serverUrl.isEmpty) return;
+          
+          final message = '🌐 Network changed: $networkStr\n'
+                         '• Time: ${DateTime.now().toIso8601String()}';
+          await _logSender.sendCustomLog(serverUrl, '', message, 'INFO');
+          print('Network change logged: $networkStr');
+        } catch (e) {
+          print('Network monitoring error: $e');
+          await BackgroundLogger.storeLogOffline('Network change failed: $e');
+        }
+      }
+    });
+    
     // Start simple periodic logging
-    Timer.periodic(const Duration(minutes: 5), (timer) async {
+    _monitoringTimer = Timer.periodic(const Duration(minutes: 5), (timer) async {
+      if (!_isCollecting) {
+        timer.cancel();
+        return;
+      }
+      
       try {
         final serverUrl = _settings.getServerUrl();
         if (serverUrl.isEmpty) return;
@@ -345,68 +449,115 @@ class _HomeScreenState extends State<HomeScreen> {
 
         final message =
             '📊 Basic Status | '
+            'Platform: ${Platform.operatingSystem} | '
             'Battery: $batteryLevel% | '
             'Network: $networkStr';
 
         await _logSender.sendCustomLog(serverUrl, '', message, 'INFO');
+        print('Basic status logged');
       } catch (e) {
         print('Basic monitoring error: $e');
+        await BackgroundLogger.storeLogOffline('Basic status failed: $e');
       }
     });
   }
 
   Future<void> _stopBasicMonitoring() async {
     print('Stopping basic monitoring');
-    // In a real app, you'd cancel the timer here
+    _monitoringTimer?.cancel();
+    _monitoringTimer = null;
+    _networkSubscription?.cancel();
+    _networkSubscription = null;
   }
 
-  Future<void> _startMonitoring() async {
+  Future<void> _startAppMonitoring() async {
     try {
-      // Try advanced monitoring
-      await AdvancedMonitor.startAdvancedMonitoring();
-    } catch (e) {
-      print('AdvancedMonitor failed: $e');
-      // Fall back to basic monitoring
-      await _startBasicMonitoring();
-      return;
-    }
-
-    // Start App Monitor
-    try {
+      // Start App Monitor for app install/uninstall detection
       _appMonitor = AppMonitor(_settings, _logSender);
       await _appMonitor!.startMonitoring();
-    } catch (e) {
-      print('AppMonitor failed: $e');
-    }
-
-    // Start Background Logger
-    try {
+      print('✅ App monitoring started');
+      
+      // Start Background Logger for offline storage
       await BackgroundLogger.startLogging();
+      print('✅ Background logging started');
+      
+      // Start app state monitoring
+      await _startAppStateMonitoring();
+      
     } catch (e) {
-      print('BackgroundLogger failed: $e');
+      print('⚠️ App monitoring error: $e');
+      // Fall back to basic only
     }
   }
 
-  Future<void> _stopMonitoring() async {
+  Future<void> _stopAppMonitoring() async {
     try {
-      await AdvancedMonitor.stopAdvancedMonitoring();
-    } catch (e) {
-      print('Error stopping AdvancedMonitor: $e');
-    }
-
-    if (_appMonitor != null) {
-      try {
+      if (_appMonitor != null) {
         await _appMonitor!.stopMonitoring();
         _appMonitor = null;
-      } catch (e) {
-        print('Error stopping AppMonitor: $e');
+        print('✅ App monitoring stopped');
       }
-    }
-
-    try {
+      
       await BackgroundLogger.stopBackgroundMonitoring();
+      print('✅ Background logging stopped');
+      
+      _appStateTimer?.cancel();
+      _appStateTimer = null;
+      
     } catch (e) {
-      print('Error stopping BackgroundLogger: $e');
+      print('⚠️ Error stopping app monitoring: $e');
+    }
+  }
+
+  Future<void> _startAppStateMonitoring() async {
+    try {
+      // Start a timer to periodically log app state
+      _appStateTimer = Timer.periodic(const Duration(minutes: 1), (timer) async {
+        if (!_isCollecting) {
+          timer.cancel();
+          return;
+        }
+        
+        await _logPeriodicAppState();
+      });
+      
+      print('✅ App state monitoring started');
+      
+    } catch (e) {
+      print('App state monitoring error: $e');
+    }
+  }
+
+  Future<void> _logPeriodicAppState() async {
+    try {
+      final serverUrl = _settings.getServerUrl();
+      if (serverUrl.isEmpty) return;
+      
+      // Get current time
+      final now = DateTime.now();
+      
+      // Log current app state
+      String appState = _currentAppState?.toString() ?? 'UNKNOWN';
+      String stateTime = _lastAppStateChange?.toIso8601String() ?? 'N/A';
+      
+      // Get app count if AppMonitor is running
+      int appCount = 0;
+      if (_appMonitor != null) {
+        appCount = await _appMonitor!.getInstalledAppsCount();
+      }
+      
+      final message = '📱 Periodic App State\n'
+                     '• Current State: $appState\n'
+                     '• Last Change: $stateTime\n'
+                     '• Installed Apps: $appCount\n'
+                     '• Time: ${now.toIso8601String()}';
+      
+      await _logSender.sendCustomLog(serverUrl, '', message, 'INFO');
+      print('Periodic app state logged');
+      
+    } catch (e) {
+      print('Error logging periodic app state: $e');
+      await BackgroundLogger.storeLogOffline('Periodic app state failed: $e');
     }
   }
 
@@ -432,8 +583,23 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<void> _checkMonitoringStats() async {
     try {
       final stats = await AdvancedMonitor.getMonitoringStats();
+      
+      // Get additional stats
+      int appCount = 0;
+      if (_appMonitor != null) {
+        appCount = await _appMonitor!.getInstalledAppsCount();
+      }
+      
+      final batteryStatus = await _battery.batteryState;
+      
       setState(() {
-        _monitoringStats = stats;
+        _monitoringStats = {
+          ...stats,
+          'installed_apps': appCount,
+          'battery_state': batteryStatus.toString(),
+          'current_app_state': _currentAppState?.toString() ?? 'Unknown',
+          'last_app_state_change': _lastAppStateChange?.toIso8601String() ?? 'N/A',
+        };
       });
 
       showDialog(
@@ -446,12 +612,13 @@ class _HomeScreenState extends State<HomeScreen> {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 _buildStatItem('Status', _isCollecting ? 'Active' : 'Inactive'),
-                _buildStatItem(
-                  'Mode',
-                  _showNativeWarning ? 'Basic (Dart-only)' : 'Advanced',
-                ),
                 _buildStatItem('Pending Logs', '$_pendingLogsCount'),
                 _buildStatItem('App Events', '$_appEventsCount'),
+                _buildStatItem('Installed Apps', '${_monitoringStats['installed_apps']}'),
+                _buildStatItem('Current App State', _monitoringStats['current_app_state']),
+                if (_monitoringStats['last_app_state_change'] != 'N/A')
+                  _buildStatItem('Last State Change', _monitoringStats['last_app_state_change']),
+                _buildStatItem('Battery State', _monitoringStats['battery_state']),
                 if (_monitoringStats['current_interval'] != null)
                   _buildStatItem(
                     'Interval',
@@ -506,7 +673,15 @@ class _HomeScreenState extends State<HomeScreen> {
       final batteryLevel = await _battery.batteryLevel;
       final batteryState = await _battery.batteryState;
       final networkResults = await _connectivity.checkConnectivity();
-      final networkStr = _getNetworkTypeString(networkResults.first);
+      final networkStr = networkResults.isNotEmpty 
+          ? _getNetworkTypeString(networkResults.first)
+          : 'No Connection';
+
+      // Get app count if AppMonitor is running
+      int appCount = 0;
+      if (_appMonitor != null) {
+        appCount = await _appMonitor!.getInstalledAppsCount();
+      }
 
       showDialog(
         context: context,
@@ -528,6 +703,12 @@ class _HomeScreenState extends State<HomeScreen> {
                   'Monitoring',
                   _isCollecting ? 'Active' : 'Inactive',
                 ),
+                if (_isCollecting)
+                  _buildStatItem('Apps Monitored', '$appCount'),
+                if (_currentAppState != null)
+                  _buildStatItem('App State', _currentAppState.toString()),
+                if (_lastAppStateChange != null)
+                  _buildStatItem('Last State Change', _lastAppStateChange!.toIso8601String()),
                 if (_showNativeWarning)
                   _buildStatItem('Note', 'Using basic monitoring mode'),
               ],
@@ -712,6 +893,34 @@ class _HomeScreenState extends State<HomeScreen> {
                   ],
                 ),
               ),
+            if (_currentAppState != null && _isCollecting) ...[
+              const SizedBox(height: 8),
+              Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 6,
+                ),
+                decoration: BoxDecoration(
+                  color: Colors.purple.withOpacity(0.1),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.apps, size: 14, color: Colors.purple),
+                    const SizedBox(width: 6),
+                    Text(
+                      'App: ${_currentAppState.toString().split('.').last}',
+                      style: const TextStyle(
+                        fontSize: 12,
+                        color: Colors.purple,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
           ],
         ),
       ),
