@@ -113,10 +113,6 @@ Create `/var/ossec/etc/rules/mhf_log_shield_rules.xml`:
 
 ```xml
 <!-- Local rules -->
-<!-- Modify it at your will. -->
-<!-- Copyright (C) 2015, Wazuh Inc. -->
-
-<!-- Example -->
 <group name="local,syslog,sshd,">
   <rule id="100001" level="5">
     <if_sid>5716</if_sid>
@@ -126,132 +122,16 @@ Create `/var/ossec/etc/rules/mhf_log_shield_rules.xml`:
   </rule>
 </group>
 
-<!-- MHF Log Shield Rules -->
-<group name="mhf_log_shield,siem,mobile_security,">
-  <!-- Base Rule - All MHF Log Shield Events -->
+<group name="mhf_log_shield">
   <rule id="200000" level="3">
     <match>MHFLogShield</match>
     <description>MHF Log Shield log detected</description>
-    <group>mhf_log_shield,siem</group>
   </rule>
   
-  <!-- CRITICAL: Security Threat Detection -->
-  <rule id="200001" level="12">
-    <if_sid>200000</if_sid>
-    <match>(malware|trojan|ransomware|spyware|exploit|backdoor|rootkit|unauthorized)</match>
-    <description>CRITICAL: Potential Mobile Security Threat Detected</description>
-    <group>mhf_log_shield,security_threat,critical</group>
-  </rule>
-  
-  <!-- HIGH: App Installation Events -->
-  <rule id="200002" level="8">
+  <rule id="200001" level="8">
     <if_sid>200000</if_sid>
     <match>APP INSTALLED</match>
-    <description>HIGH: Mobile App Installation Detected</description>
-    <group>mhf_log_shield,software_added,change_control</group>
-  </rule>
-  
-  <!-- HIGH: App Uninstallation Events -->
-  <rule id="200003" level="8">
-    <if_sid>200000</if_sid>
-    <match>APP UNINSTALLED</match>
-    <description>HIGH: Mobile App Uninstallation Detected</description>
-    <group>mhf_log_shield,software_removed,change_control</group>
-  </rule>
-  
-  <!-- MEDIUM: App Update Events -->
-  <rule id="200004" level="7">
-    <if_sid>200000</if_sid>
-    <match>APP UPDATED</match>
-    <description>MEDIUM: Mobile App Update Detected</description>
-    <group>mhf_log_shield,software_updated,patch_management</group>
-  </rule>
-  
-  <!-- MEDIUM: App Foreground/Background State Changes -->
-  <rule id="200005" level="6">
-    <if_sid>200000</if_sid>
-    <match>App State: FOREGROUND</match>
-    <description>MEDIUM: App Moved to Foreground</description>
-    <group>mhf_log_shield,application_state,user_activity</group>
-  </rule>
-  
-  <rule id="200006" level="6">
-    <if_sid>200000</if_sid>
-    <match>App State: BACKGROUND</match>
-    <description>MEDIUM: App Moved to Background</description>
-    <group>mhf_log_shield,application_state,user_activity</group>
-  </rule>
-  
-  <!-- MEDIUM: Network Connectivity Changes -->
-  <rule id="200007" level="5">
-    <if_sid>200000</if_sid>
-    <match>Network changed:</match>
-    <description>MEDIUM: Network State Changed</description>
-    <group>mhf_log_shield,network,connectivity</group>
-  </rule>
-  
-  <!-- HIGH: Connection to Untrusted Networks -->
-  <rule id="200008" level="7">
-    <if_sid>200007</if_sid>
-    <match>(Public WiFi|Open Network|Hotspot)</match>
-    <description>HIGH: Device Connected to Untrusted Network</description>
-    <group>mhf_log_shield,network,security_risk</group>
-  </rule>
-  
-  <!-- LOW: Battery Status -->
-  <rule id="200009" level="3">
-    <if_sid>200000</if_sid>
-    <match>Battery:</match>
-    <description>LOW: Battery Status Update</description>
-    <group>mhf_log_shield,device_status,battery</group>
-  </rule>
-  
-  <!-- HIGH: Critical Battery Level -->
-  <rule id="200010" level="8">
-    <if_sid>200009</if_sid>
-    <regex>Battery: ([0-5])%</regex>
-    <description>CRITICAL: Battery Critically Low (\1%) - Device may shut down</description>
-    <group>mhf_log_shield,device_status,critical,battery</group>
-  </rule>
-  
-  <!-- MEDIUM: Low Battery Warning -->
-  <rule id="200011" level="6">
-    <if_sid>200009</if_sid>
-    <regex>Battery: ([6-9]|1[0-9])%</regex>
-    <description>MEDIUM: Battery Low (\1%)</description>
-    <group>mhf_log_shield,device_status,warning,battery</group>
-  </rule>
-  
-  <!-- LOW: Periodic Device Status -->
-  <rule id="200012" level="2">
-    <if_sid>200000</if_sid>
-    <match>Status Update</match>
-    <description>LOW: Periodic Device Status Update</description>
-    <group>mhf_log_shield,device_status,periodic</group>
-  </rule>
-  
-  <!-- HIGH: Application Error Events -->
-  <rule id="200013" level="9">
-    <if_sid>200000</if_sid>
-    <match>ERROR:</match>
-    <description>HIGH: Application Error Detected</description>
-    <group>mhf_log_shield,application_error</group>
-  </rule>
-  
-  <!-- MEDIUM: Application Warning Events -->
-  <rule id="200014" level="5">
-    <if_sid>200000</if_sid>
-    <match>WARNING:</match>
-    <description>MEDIUM: Application Warning</description>
-    <group>mhf_log_shield,application_warning</group>
-  </rule>
-  
-  <!-- COMPLIANCE: Device Inventory Report -->
-  <rule id="200015" level="2">
-    <if_sid>200000</if_sid>
-    <match>App Inventory</match>
-    <description>COMPLIANCE: Device Application Inventory Report</description>
-    <group>mhf_log_shield,compliance,inventory</group>
+    <description>Mobile App Installation Detected</description>
   </rule>
 </group>
 ```
